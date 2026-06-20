@@ -1,0 +1,5 @@
+/target
+/.git
+/.github
+**/*.der
+server-cert.der
