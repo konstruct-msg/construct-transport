@@ -3,7 +3,23 @@ name = "construct-transport"
 version = "0.1.0"
 authors = ["Construct Team"]
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.85"
 license = "MIT"
+repository = "https://github.com/construct-msg/construct-transport"
+
+# Phase 0 diagnostic spike: prove bidi gRPC-over-HTTP/3 works on a native
+# quinn+h3 server (no Traefik). Versions pinned to match construct-engine,
+# which already compiles this stack for aarch64-apple-ios.
 
 [dependencies]
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+http = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
