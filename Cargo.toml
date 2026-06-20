@@ -1,0 +1,9 @@
+[package]
+name = "construct-transport"
+version = "0.1.0"
+authors = ["Construct Team"]
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+
+[dependencies]
