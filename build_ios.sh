@@ -121,8 +121,9 @@ generate_bindings() {
   if [ -f "$TMP/bindings/construct_transportFFI.modulemap" ]; then
     cp "$TMP/bindings/construct_transportFFI.modulemap" "$TMP/module.modulemap"
   else
+    # Module name must match the generated Swift `import construct_transportFFI`.
     cat > "$TMP/module.modulemap" << 'EOF'
-module ConstructTransportFFI {
+module construct_transportFFI {
     umbrella header "construct_transportFFI.h"
     export *
 }
