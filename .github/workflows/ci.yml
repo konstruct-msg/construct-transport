@@ -47,7 +47,10 @@ jobs:
         with:
           images: ghcr.io/konstruct-msg/construct-transport
           tags: |
-            type=ref,event=branch
+            # main push → :main + :latest (explicit, no reliance on event detection)
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # version tags (vX.Y.Z) → :X.Y.Z ; every build also gets immutable :sha-<sha>
             type=semver,pattern={{version}}
             type=sha
       - uses: docker/build-push-action@v6
