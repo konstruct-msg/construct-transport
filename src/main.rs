@@ -24,7 +24,10 @@ async fn main() -> Result<()> {
         .init();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let bundle = tls::self_signed(vec!["localhost".to_string()])?;
+    // Cert SAN must equal the SNI the client validates against
+    // (QUIC_SAN, e.g. quic.konstruct.cc; defaults to localhost for local runs).
+    let san = std::env::var("QUIC_SAN").unwrap_or_else(|_| "localhost".to_string());
+    let bundle = tls::self_signed(vec![san])?;
     std::fs::write("server-cert.der", bundle.cert.as_ref())?;
 
     let server_config = tls::server_config(&bundle)?;
