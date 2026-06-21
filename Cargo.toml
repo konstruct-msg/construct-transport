@@ -36,7 +36,7 @@ tokio-stream = "0.1"
 
 # UniFFI surface (Phase 1) — Swift bindings for iOS. "tokio" drives async FFI
 # methods; "cli" provides the uniffi-bindgen binary.
-uniffi = { version = "0.28", features = ["tokio", "cli"] }
+uniffi = { version = "0.30", features = ["tokio", "cli"] }
 thiserror = "2"
 
 [dev-dependencies]

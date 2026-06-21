@@ -1,4 +1,5 @@
 /target
 /bindings
+/.build_tmp
 .DS_Store
 server-cert.der
