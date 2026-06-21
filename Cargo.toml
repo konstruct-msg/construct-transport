@@ -23,3 +23,13 @@ http = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# h3 -> h2c upstream leg (Phase 0.5 reverse proxy to envoy:8080)
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+# h2c echo upstream (stands in for envoy) in the proxy integration test
+hyper = { version = "1", features = ["server", "http2"] }

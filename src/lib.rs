@@ -11,4 +11,5 @@
 
 pub mod echo_server;
 pub mod grpc;
+pub mod proxy;
 pub mod tls;
