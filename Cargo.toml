@@ -11,6 +11,10 @@ repository = "https://github.com/construct-msg/construct-transport"
 # quinn+h3 server (no Traefik). Versions pinned to match construct-engine,
 # which already compiles this stack for aarch64-apple-ios.
 
+# staticlib/cdylib for the UniFFI iOS surface (Phase 1); lib for the bins/tests.
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
 [dependencies]
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 h3 = "0.0.8"
@@ -29,6 +33,11 @@ hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-stream = "0.1"
+
+# UniFFI surface (Phase 1) — Swift bindings for iOS. "tokio" drives async FFI
+# methods; "cli" provides the uniffi-bindgen binary.
+uniffi = { version = "0.28", features = ["tokio", "cli"] }
+thiserror = "2"
 
 [dev-dependencies]
 # h2c echo upstream (stands in for envoy) in the proxy integration test
