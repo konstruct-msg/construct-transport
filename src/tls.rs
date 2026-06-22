@@ -40,7 +40,11 @@ pub fn self_signed(names: Vec<String>) -> Result<CertBundle> {
 /// once. Both files must be present to reuse an existing pair — the old gateway wrote
 /// only the cert (the key was ephemeral), so a cert-without-key is regenerated. Persist
 /// the paths on a mounted volume; otherwise the container's filesystem resets the pair.
-pub fn load_or_generate(names: Vec<String>, cert_path: &Path, key_path: &Path) -> Result<CertBundle> {
+pub fn load_or_generate(
+    names: Vec<String>,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<CertBundle> {
     if cert_path.exists() && key_path.exists() {
         let cert = CertificateDer::from(
             fs::read(cert_path).with_context(|| format!("read cert {}", cert_path.display()))?,
@@ -85,7 +89,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("construct-transport-test-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "construct-transport-test-{}-{name}",
+            std::process::id()
+        ))
     }
 
     #[test]
