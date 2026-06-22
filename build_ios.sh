@@ -116,20 +116,32 @@ generate_bindings() {
   cp "$TMP/bindings/construct_transport.swift" "$SWIFT_DEST/construct_transport.swift"
   ok "construct_transport.swift → $SWIFT_DEST"
 
-  cp "$TMP/bindings/${LIB#lib}FFI.h" "$TMP/construct_transportFFI.h" 2>/dev/null \
-    || cp "$TMP/bindings/construct_transportFFI.h" "$TMP/construct_transportFFI.h"
-  if [ -f "$TMP/bindings/construct_transportFFI.modulemap" ]; then
-    cp "$TMP/bindings/construct_transportFFI.modulemap" "$TMP/module.modulemap"
-  else
-    # Module name must match the generated Swift `import construct_transportFFI`.
-    cat > "$TMP/module.modulemap" << 'EOF'
+  # Follow construct-core's pattern: the FFI C header lives in the app source
+  # tree (found via SWIFT_INCLUDE_PATHS), NOT inside the xcframework. This avoids
+  # the "Multiple commands produce include/module.modulemap" collision you get
+  # when two static-library xcframeworks each ship Headers/module.modulemap.
+  cp "$TMP/bindings/construct_transportFFI.h" "$SWIFT_DEST/construct_transportFFI.h"
+  ok "construct_transportFFI.h → $SWIFT_DEST"
+
+  # Ensure the shared source modulemap declares `construct_transportFFI`. The
+  # file ($SWIFT_DEST/module.modulemap) already declares construct_coreFFI; a
+  # single modulemap can declare multiple modules.
+  local mm="$SWIFT_DEST/module.modulemap"
+  if [ -f "$mm" ] && ! grep -q "module construct_transportFFI" "$mm"; then
+    cat >> "$mm" << 'EOF'
+
 module construct_transportFFI {
-    umbrella header "construct_transportFFI.h"
+    header "construct_transportFFI.h"
     export *
+    use "Darwin"
+    use "_Builtin_stdbool"
+    use "_Builtin_stdint"
 }
 EOF
+    ok "added construct_transportFFI to $mm"
+  else
+    ok "module.modulemap already declares construct_transportFFI"
   fi
-  ok "FFI headers saved"
 }
 
 # ── One target ────────────────────────────────────────────────────────────────
@@ -169,19 +181,17 @@ fi
 $BUILD_MAC && build_target "aarch64-apple-darwin"
 
 # ── Assemble slices ───────────────────────────────────────────────────────────
+# xcframework ships the static lib ONLY (no Headers) — exactly like
+# ConstructCore.xcframework. The FFI header + modulemap live in the app source
+# tree (see generate_bindings), so there is no include/module.modulemap clash
+# with ConstructEngine.xcframework.
 hdr "Assembling ConstructTransport.xcframework"
-make_headers_dir() {
-  local dir="$1/Headers"; mkdir -p "$dir"
-  cp "$TMP/construct_transportFFI.h" "$dir/"
-  cp "$TMP/module.modulemap"         "$dir/"
-}
 XCARGS=()
 
 if $BUILD_IOS; then
   d="$TMP/slice_ios"; mkdir -p "$d"
   cp "$TRANSPORT_ROOT/target/aarch64-apple-ios/$PROFILE/$LIB.a" "$d/$LIB.a"
-  make_headers_dir "$d"
-  XCARGS+=(-library "$d/$LIB.a" -headers "$d/Headers")
+  XCARGS+=(-library "$d/$LIB.a")
 fi
 if $BUILD_SIM; then
   d="$TMP/slice_sim"; mkdir -p "$d"
@@ -189,14 +199,12 @@ if $BUILD_SIM; then
     "$TRANSPORT_ROOT/target/aarch64-apple-ios-sim/$PROFILE/$LIB.a" \
     "$TRANSPORT_ROOT/target/x86_64-apple-ios/$PROFILE/$LIB.a" \
     -output "$d/$LIB.a"
-  make_headers_dir "$d"
-  XCARGS+=(-library "$d/$LIB.a" -headers "$d/Headers")
+  XCARGS+=(-library "$d/$LIB.a")
 fi
 if $BUILD_MAC; then
   d="$TMP/slice_mac"; mkdir -p "$d"
   cp "$TRANSPORT_ROOT/target/aarch64-apple-darwin/$PROFILE/$LIB.a" "$d/$LIB.a"
-  make_headers_dir "$d"
-  XCARGS+=(-library "$d/$LIB.a" -headers "$d/Headers")
+  XCARGS+=(-library "$d/$LIB.a")
 fi
 [ "${#XCARGS[@]}" -gt 0 ] || fail "no slices to assemble — check platform flags."
 

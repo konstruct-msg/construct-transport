@@ -27,8 +27,10 @@ fn err(e: anyhow::Error) -> TransportError {
 }
 
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).
+/// Named `GrpcHeader` (not `Metadata`) to avoid colliding with gRPC-swift's
+/// `Metadata` type in the app module.
 #[derive(uniffi::Record)]
-pub struct Metadata {
+pub struct GrpcHeader {
     pub key: String,
     pub value: String,
 }
@@ -62,7 +64,7 @@ impl QuicChannel {
     pub async fn open_stream(
         &self,
         path: String,
-        metadata: Vec<Metadata>,
+        metadata: Vec<GrpcHeader>,
     ) -> Result<Arc<QuicStream>, TransportError> {
         let md: Vec<(String, String)> = metadata.into_iter().map(|m| (m.key, m.value)).collect();
         let stream = self.inner.open_stream(&path, &md).await.map_err(err)?;
@@ -110,11 +112,11 @@ impl QuicStream {
     }
 
     /// Read trailing metadata (e.g. `grpc-status`) after the stream ends.
-    pub async fn recv_trailers(&self) -> Result<Vec<Metadata>, TransportError> {
+    pub async fn recv_trailers(&self) -> Result<Vec<GrpcHeader>, TransportError> {
         let trailers = self.recv.lock().await.recv_trailers().await.map_err(err)?;
         Ok(trailers
             .into_iter()
-            .map(|(key, value)| Metadata { key, value })
+            .map(|(key, value)| GrpcHeader { key, value })
             .collect())
     }
 }
