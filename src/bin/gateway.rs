@@ -2,15 +2,21 @@
 //!
 //! Production-shaped entrypoint: terminates QUIC/H3 from clients and reverse-
 //! proxies each gRPC call to an upstream h2c endpoint (envoy), bypassing
-//! Traefik. Self-signed cert for now (clients pin it); real cert is a later
-//! step.
+//! Traefik. Self-signed cert (clients pin it); persisted across restarts so the
+//! pinned DER stays stable. Real CA-issued cert is a later step.
 //!
 //! Env:
-//!   QUIC_BIND      bind address          (default 0.0.0.0:443)
-//!   QUIC_UPSTREAM  h2c upstream host:port(default envoy:8080)
-//!   QUIC_SAN       cert SAN / client SNI (default localhost)
+//!   QUIC_BIND      bind address           (default 0.0.0.0:443)
+//!   QUIC_UPSTREAM  h2c upstream host:port (default envoy:8080)
+//!   QUIC_SAN       cert SAN / client SNI  (default localhost)
+//!   QUIC_CERT_PATH persistent cert (DER)  (default server-cert.der)
+//!   QUIC_KEY_PATH  persistent key  (DER)  (default server-key.der)
+//!
+//! Mount QUIC_CERT_PATH/QUIC_KEY_PATH on a volume so the pair survives container
+//! recreation; clients bundle the cert as `quic_gateway.der`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use construct_transport::{proxy, tls};
@@ -32,15 +38,19 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "0.0.0.0:443".parse().unwrap());
     let upstream = std::env::var("QUIC_UPSTREAM").unwrap_or_else(|_| "envoy:8080".to_string());
     let san = std::env::var("QUIC_SAN").unwrap_or_else(|_| "localhost".to_string());
+    let cert_path =
+        PathBuf::from(std::env::var("QUIC_CERT_PATH").unwrap_or_else(|_| "server-cert.der".into()));
+    let key_path =
+        PathBuf::from(std::env::var("QUIC_KEY_PATH").unwrap_or_else(|_| "server-key.der".into()));
 
-    let bundle = tls::self_signed(vec![san.clone()])?;
-    std::fs::write("server-cert.der", bundle.cert.as_ref())?;
+    let bundle = tls::load_or_generate(vec![san.clone()], &cert_path, &key_path)?;
     let server_config = tls::server_config(&bundle)?;
 
     let handle = proxy::serve(server_config, bind, upstream.clone()).await?;
     info!(
         addr = %handle.addr, %upstream, %san,
-        "construct-transport gateway listening (h3 -> h2c); cert → server-cert.der"
+        cert = %cert_path.display(), key = %key_path.display(),
+        "construct-transport gateway listening (h3 -> h2c); persistent cert"
     );
     handle.task.await?;
     Ok(())
