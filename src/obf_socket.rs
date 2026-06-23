@@ -25,9 +25,8 @@ fn obfuscated_endpoint(
     obf: Salamander,
     server_config: Option<ServerConfig>,
 ) -> io::Result<Endpoint> {
-    let runtime = quinn::default_runtime().ok_or_else(|| {
-        io::Error::other("no async runtime for QUIC endpoint")
-    })?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| io::Error::other("no async runtime for QUIC endpoint"))?;
     let std_socket = std::net::UdpSocket::bind(bind)?;
     let inner = runtime.wrap_udp_socket(std_socket)?;
     let socket = Arc::new(ObfuscatedUdpSocket::new(inner, obf));
