@@ -18,15 +18,16 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, ServerConfig, UdpPoller};
 use rand::RngCore;
 
-use crate::salamander::{Salamander, SALT_LEN};
+use crate::salamander::{SALT_LEN, Salamander};
 
 fn obfuscated_endpoint(
     bind: SocketAddr,
     obf: Salamander,
     server_config: Option<ServerConfig>,
 ) -> io::Result<Endpoint> {
-    let runtime = quinn::default_runtime()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no async runtime for QUIC endpoint"))?;
+    let runtime = quinn::default_runtime().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "no async runtime for QUIC endpoint")
+    })?;
     let std_socket = std::net::UdpSocket::bind(bind)?;
     let inner = runtime.wrap_udp_socket(std_socket)?;
     let socket = Arc::new(ObfuscatedUdpSocket::new(inner, obf));
@@ -61,7 +62,8 @@ impl ObfuscatedUdpSocket {
 impl fmt::Debug for ObfuscatedUdpSocket {
     // Never print the PSK.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ObfuscatedUdpSocket").finish_non_exhaustive()
+        f.debug_struct("ObfuscatedUdpSocket")
+            .finish_non_exhaustive()
     }
 }
 

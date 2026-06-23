@@ -30,13 +30,18 @@ async fn obfuscated_bidi_roundtrips_and_plain_client_is_rejected() -> Result<()>
     let addr = server.addr;
 
     // ── obfuscated client (matching PSK) ─────────────────────────────────
-    let mut client_ep =
-        obf_socket::obfuscated_client_endpoint("127.0.0.1:0".parse()?, Salamander::new(PSK.to_vec()))?;
+    let mut client_ep = obf_socket::obfuscated_client_endpoint(
+        "127.0.0.1:0".parse()?,
+        Salamander::new(PSK.to_vec()),
+    )?;
     client_ep.set_default_client_config(client_config.clone());
 
-    let conn = tokio::time::timeout(Duration::from_secs(5), client_ep.connect(addr, "localhost")?)
-        .await
-        .expect("obfuscated QUIC handshake timed out")?;
+    let conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        client_ep.connect(addr, "localhost")?,
+    )
+    .await
+    .expect("obfuscated QUIC handshake timed out")?;
 
     let (mut driver, mut send_req) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
     let drive = tokio::spawn(async move {
@@ -54,7 +59,11 @@ async fn obfuscated_bidi_roundtrips_and_plain_client_is_rejected() -> Result<()>
     let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
         .await
         .expect("recv_response timed out through obfuscation")?;
-    assert_eq!(resp.status(), 200, "obfuscated path should reach the server");
+    assert_eq!(
+        resp.status(),
+        200,
+        "obfuscated path should reach the server"
+    );
 
     let mut buf = BytesMut::new();
     for i in 0..3u32 {
