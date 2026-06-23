@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Pre-push: refuse to push unformatted Rust. Run `cargo fmt --all` to fix.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# (or run ./scripts/install-hooks.sh)
+set -euo pipefail
+
+# Allow an escape hatch for emergencies: SKIP_FMT=1 git push
+if [[ "${SKIP_FMT:-0}" == "1" ]]; then
+    echo "pre-push: SKIP_FMT=1 — skipping cargo fmt check" >&2
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not found — skipping fmt check" >&2
+    exit 0
+fi
+
+echo "pre-push: cargo fmt --all -- --check" >&2
+if ! cargo fmt --all -- --check; then
+    echo >&2
+    echo "pre-push: ✗ formatting check failed." >&2
+    echo "          Run 'cargo fmt --all' and commit the result, then push again." >&2
+    echo "          (emergency bypass: SKIP_FMT=1 git push)" >&2
+    exit 1
+fi
+
+echo "pre-push: ✓ formatting OK" >&2
