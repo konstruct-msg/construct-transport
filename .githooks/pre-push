@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Pre-push: refuse to push unformatted Rust. Run `cargo fmt --all` to fix.
+# Pre-push: refuse to push Rust that isn't formatted or that clippy rejects.
+# Fix with `cargo fmt --all` and by resolving the clippy warnings.
 #
 # Enable once per clone:  git config core.hooksPath .githooks
 # (or run ./scripts/install-hooks.sh)
 set -euo pipefail
 
-# Allow an escape hatch for emergencies: SKIP_FMT=1 git push
-if [[ "${SKIP_FMT:-0}" == "1" ]]; then
-    echo "pre-push: SKIP_FMT=1 — skipping cargo fmt check" >&2
+# Allow an escape hatch for emergencies: SKIP_CHECKS=1 git push
+# (SKIP_FMT is still honoured as a legacy alias.)
+if [[ "${SKIP_CHECKS:-0}" == "1" || "${SKIP_FMT:-0}" == "1" ]]; then
+    echo "pre-push: SKIP_CHECKS=1 — skipping fmt + clippy checks" >&2
     exit 0
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "pre-push: cargo not found — skipping fmt check" >&2
+    echo "pre-push: cargo not found — skipping checks" >&2
     exit 0
 fi
 
@@ -21,8 +23,17 @@ if ! cargo fmt --all -- --check; then
     echo >&2
     echo "pre-push: ✗ formatting check failed." >&2
     echo "          Run 'cargo fmt --all' and commit the result, then push again." >&2
-    echo "          (emergency bypass: SKIP_FMT=1 git push)" >&2
+    echo "          (emergency bypass: SKIP_CHECKS=1 git push)" >&2
     exit 1
 fi
-
 echo "pre-push: ✓ formatting OK" >&2
+
+echo "pre-push: cargo clippy --all-targets -- -D warnings" >&2
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo >&2
+    echo "pre-push: ✗ clippy found warnings (treated as errors)." >&2
+    echo "          Fix them and push again — this is the check that blocked the gateway build." >&2
+    echo "          (emergency bypass: SKIP_CHECKS=1 git push)" >&2
+    exit 1
+fi
+echo "pre-push: ✓ clippy clean" >&2
