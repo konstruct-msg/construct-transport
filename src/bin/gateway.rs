@@ -72,7 +72,10 @@ async fn main() -> Result<()> {
 
 /// Decode a hex string (e.g. the Salamander PSK from `QUIC_OBF_PSK`) into bytes.
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    anyhow::ensure!(s.len() % 2 == 0, "QUIC_OBF_PSK hex must have even length");
+    anyhow::ensure!(
+        s.len().is_multiple_of(2),
+        "QUIC_OBF_PSK hex must have even length"
+    );
     (0..s.len())
         .step_by(2)
         .map(|i| {

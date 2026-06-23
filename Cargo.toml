@@ -3,7 +3,7 @@ name = "construct-transport"
 version = "0.2.0"
 authors = ["Construct Team"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/construct-msg/construct-transport"
 

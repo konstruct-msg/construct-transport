@@ -75,10 +75,10 @@ async fn bidi_grpc_over_h3_roundtrips() -> Result<()> {
     // ── half-close, drain, read trailers ─────────────────────────────────
     stream.finish().await?;
     while (stream.recv_data().await?).is_some() {}
-    if let Some(trailers) = stream.recv_trailers().await? {
-        if let Some(status) = trailers.get("grpc-status") {
-            assert_eq!(status, "0", "grpc-status should be OK");
-        }
+    if let Some(trailers) = stream.recv_trailers().await?
+        && let Some(status) = trailers.get("grpc-status")
+    {
+        assert_eq!(status, "0", "grpc-status should be OK");
     }
 
     drive.abort();
