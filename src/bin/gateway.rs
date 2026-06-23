@@ -11,9 +11,11 @@
 //!   QUIC_SAN       cert SAN / client SNI  (default localhost)
 //!   QUIC_CERT_PATH persistent cert (DER)  (default server-cert.der)
 //!   QUIC_KEY_PATH  persistent key  (DER)  (default server-key.der)
+//!   QUIC_OBF_PSK   Salamander PSK (hex)   (unset = plain QUIC; set = obfuscated listener)
 //!
 //! Mount QUIC_CERT_PATH/QUIC_KEY_PATH on a volume so the pair survives container
-//! recreation; clients bundle the cert as `quic_gateway.der`.
+//! recreation; clients bundle the cert as `quic_gateway.der`. When QUIC_OBF_PSK is set,
+//! every datagram is Salamander-obfuscated and only clients with the same PSK can connect.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,15 +46,38 @@ async fn main() -> Result<()> {
         PathBuf::from(std::env::var("QUIC_KEY_PATH").unwrap_or_else(|_| "server-key.der".into()));
 
     let bundle = tls::load_or_generate(vec![san.clone()], &cert_path, &key_path)?;
-    let server_config = tls::server_config(&bundle)?;
 
-    let handle = proxy::serve(server_config, bind, upstream.clone()).await?;
+    // Optional Salamander obfuscation: a hex PSK switches the listener to the DPI-evading
+    // path (every datagram obfuscated; only clients with the same PSK can handshake).
+    let obf_psk = std::env::var("QUIC_OBF_PSK")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| decode_hex(s.trim()))
+        .transpose()?;
+
+    let obfuscated = obf_psk.is_some();
+    let handle = match obf_psk {
+        Some(psk) => proxy::serve_obfuscated(&bundle, bind, upstream.clone(), psk).await?,
+        None => proxy::serve(tls::server_config(&bundle)?, bind, upstream.clone()).await?,
+    };
     info!(
-        addr = %handle.addr, %upstream, %san,
+        addr = %handle.addr, %upstream, %san, obfuscated,
         cert = %cert_path.display(), key = %key_path.display(),
         keep_alive_secs = tls::QUIC_KEEP_ALIVE_SECS, max_idle_secs = tls::QUIC_MAX_IDLE_SECS,
         "construct-transport gateway listening (h3 -> h2c); persistent cert + keep-alive"
     );
     handle.task.await?;
     Ok(())
+}
+
+/// Decode a hex string (e.g. the Salamander PSK from `QUIC_OBF_PSK`) into bytes.
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(s.len() % 2 == 0, "QUIC_OBF_PSK hex must have even length");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("QUIC_OBF_PSK invalid hex: {e}"))
+        })
+        .collect()
 }

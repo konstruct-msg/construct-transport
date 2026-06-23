@@ -25,6 +25,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
+use crate::obf_socket;
+use crate::salamander::Salamander;
+
 /// Concrete h3 server stream over a quinn bidi stream.
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
@@ -42,7 +45,28 @@ pub async fn serve(
     bind: SocketAddr,
     upstream: String,
 ) -> Result<ProxyHandle> {
-    let endpoint = Endpoint::server(server_config, bind)?;
+    serve_on_endpoint(Endpoint::server(server_config, bind)?, upstream)
+}
+
+/// Like [`serve`] but Salamander-obfuscates every datagram with `psk` (the DPI-evading
+/// listener). Clients MUST connect with the same PSK via `QuicChannel::connect_obfuscated`;
+/// a plain QUIC client cannot complete the handshake. `psk` is provisioned out-of-band
+/// (veil-ticket), never hardcoded. The QUIC MTU is lowered to make room for the salt.
+pub async fn serve_obfuscated(
+    bundle: &crate::tls::CertBundle,
+    bind: SocketAddr,
+    upstream: String,
+    psk: Vec<u8>,
+) -> Result<ProxyHandle> {
+    let server_config = crate::tls::server_config_obf(bundle)?;
+    let endpoint =
+        obf_socket::obfuscated_server_endpoint(bind, Salamander::new(psk), server_config)?;
+    serve_on_endpoint(endpoint, upstream)
+}
+
+/// Run the accept-loop on a pre-built endpoint — shared by the plain and obfuscated paths
+/// (only the underlying UDP socket / MTU differs).
+fn serve_on_endpoint(endpoint: Endpoint, upstream: String) -> Result<ProxyHandle> {
     let addr = endpoint.local_addr()?;
     let accept_ep = endpoint.clone();
     let task = tokio::spawn(async move {
