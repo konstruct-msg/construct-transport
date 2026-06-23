@@ -50,7 +50,8 @@ async fn main() -> Result<()> {
     info!(
         addr = %handle.addr, %upstream, %san,
         cert = %cert_path.display(), key = %key_path.display(),
-        "construct-transport gateway listening (h3 -> h2c); persistent cert"
+        keep_alive_secs = tls::QUIC_KEEP_ALIVE_SECS, max_idle_secs = tls::QUIC_MAX_IDLE_SECS,
+        "construct-transport gateway listening (h3 -> h2c); persistent cert + keep-alive"
     );
     handle.task.await?;
     Ok(())

@@ -62,6 +62,11 @@ pub fn load_or_generate(
     Ok(bundle)
 }
 
+/// QUIC keep-alive PING interval (seconds). Must stay well below `QUIC_MAX_IDLE_SECS`.
+pub const QUIC_KEEP_ALIVE_SECS: u64 = 10;
+/// QUIC max idle timeout (seconds) — connection dies after this much inactivity.
+pub const QUIC_MAX_IDLE_SECS: u64 = 30;
+
 /// Shared QUIC transport tuning. A long-lived gRPC stream (e.g. MessageStream) sits idle
 /// between messages; without an explicit keep-alive the QUIC connection hits the idle
 /// timeout and dies mid-stream (observed device + gateway bug: client "open timed out",
@@ -70,8 +75,8 @@ pub fn load_or_generate(
 /// side is quiet still refreshes the connection and the negotiated idle timeout is generous.
 fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
     let mut tc = quinn::TransportConfig::default();
-    tc.keep_alive_interval(Some(Duration::from_secs(10)));
-    tc.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+    tc.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)));
+    tc.max_idle_timeout(Some(Duration::from_secs(QUIC_MAX_IDLE_SECS).try_into()?));
     Ok(Arc::new(tc))
 }
 
