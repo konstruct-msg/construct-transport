@@ -75,7 +75,10 @@ pub const QUIC_MAX_IDLE_SECS: u64 = 30;
 /// side is quiet still refreshes the connection and the negotiated idle timeout is generous.
 /// Build a transport config with explicit keep-alive / idle timeouts (exposed so tests
 /// can exercise the keep-alive behaviour with short timeouts).
-pub fn build_transport_config(keep_alive: Duration, max_idle: Duration) -> Result<Arc<quinn::TransportConfig>> {
+pub fn build_transport_config(
+    keep_alive: Duration,
+    max_idle: Duration,
+) -> Result<Arc<quinn::TransportConfig>> {
     let mut tc = quinn::TransportConfig::default();
     tc.keep_alive_interval(Some(keep_alive));
     tc.max_idle_timeout(Some(max_idle.try_into()?));
@@ -95,7 +98,10 @@ pub fn server_config(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
 }
 
 /// Like `server_config` but with a caller-supplied transport config (tests).
-pub fn server_config_tuned(bundle: &CertBundle, transport: Arc<quinn::TransportConfig>) -> Result<quinn::ServerConfig> {
+pub fn server_config_tuned(
+    bundle: &CertBundle,
+    transport: Arc<quinn::TransportConfig>,
+) -> Result<quinn::ServerConfig> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.key_der.clone()));
     let mut tls = RustlsServerConfig::builder()
         .with_no_client_auth()
@@ -113,7 +119,10 @@ pub fn client_config(trust: &CertBundle) -> Result<quinn::ClientConfig> {
 }
 
 /// Like `client_config` but with a caller-supplied transport config (tests).
-pub fn client_config_tuned(trust: &CertBundle, transport: Arc<quinn::TransportConfig>) -> Result<quinn::ClientConfig> {
+pub fn client_config_tuned(
+    trust: &CertBundle,
+    transport: Arc<quinn::TransportConfig>,
+) -> Result<quinn::ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.add(trust.cert.clone())?;
     let mut tls = RustlsClientConfig::builder()
