@@ -64,6 +64,14 @@ fn err(e: anyhow::Error) -> TransportError {
     TransportError::Transport(format!("{e:#}"))
 }
 
+/// Build/behaviour marker so the iOS app log can confirm exactly which transport binary
+/// (.a) is actually linked — Xcode silently reuses a cached static lib, which has masked
+/// several fixes. Bump on changes that need on-device verification.
+#[uniffi::export]
+pub fn transport_build_marker() -> String {
+    "quic-rt-2026-06-23".to_string()
+}
+
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).
 /// Named `GrpcHeader` (not `Metadata`) to avoid colliding with gRPC-swift's
 /// `Metadata` type in the app module.
