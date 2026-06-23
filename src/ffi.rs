@@ -69,7 +69,7 @@ fn err(e: anyhow::Error) -> TransportError {
 /// several fixes. Bump on changes that need on-device verification.
 #[uniffi::export]
 pub fn transport_build_marker() -> String {
-    "quic-rt-2026-06-23".to_string()
+    "quic-rt-stats-2026-06-23".to_string()
 }
 
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).
@@ -128,6 +128,14 @@ impl QuicChannel {
             send: Arc::new(Mutex::new(send)),
             recv: Arc::new(Mutex::new(recv)),
         }))
+    }
+
+    /// Diagnostic: live quinn connection stats (tx/rx datagrams, PING frames sent, RTT,
+    /// close reason). Runs on `RT`, so it also proves the dedicated runtime is responsive.
+    /// `ping_tx` not growing over time ⇒ keep-alive isn't firing.
+    pub async fn connection_stats(&self) -> Result<String, TransportError> {
+        let client = self.inner.clone();
+        on_rt(async move { Ok(client.stats_string()) }).await
     }
 }
 

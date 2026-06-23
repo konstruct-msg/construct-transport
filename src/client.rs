@@ -31,6 +31,7 @@ pub struct QuicClient {
     _endpoint: Endpoint,
     send_request: H3SendRequest,
     authority: String,
+    conn: quinn::Connection,
     _driver: tokio::task::JoinHandle<()>,
 }
 
@@ -71,6 +72,7 @@ impl QuicClient {
             .context("QUIC handshake timed out")?
             .context("QUIC handshake failed")?;
 
+        let conn_for_stats = conn.clone();
         let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -80,8 +82,25 @@ impl QuicClient {
             _endpoint: endpoint,
             send_request,
             authority: server_name.to_string(),
+            conn: conn_for_stats,
             _driver: driver_task,
         })
+    }
+
+    /// Diagnostic snapshot of the live quinn connection. `ping` is the count of
+    /// keep-alive PING frames sent — if it does not grow over time, keep-alive is not
+    /// firing. `close` is the connection's close reason (None while healthy).
+    pub fn stats_string(&self) -> String {
+        let s = self.conn.stats();
+        format!(
+            "tx_pkts={} rx_pkts={} ping_tx={} rtt={}ms lost={} close={:?}",
+            s.udp_tx.datagrams,
+            s.udp_rx.datagrams,
+            s.frame_tx.ping,
+            self.conn.rtt().as_millis(),
+            s.path.lost_packets,
+            self.conn.close_reason(),
+        )
     }
 
     /// Open a gRPC call on `path` (`/package.Service/Method`) with extra request
