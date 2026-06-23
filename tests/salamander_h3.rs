@@ -17,8 +17,9 @@ async fn obfuscated_bidi_roundtrips_and_plain_client_is_rejected() -> Result<()>
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let bundle = tls::self_signed(vec!["localhost".to_string()])?;
-    let server_config = tls::server_config(&bundle)?;
-    let client_config = tls::client_config(&bundle)?;
+    // Obfuscated configs lower the QUIC MTU to make room for the Salamander salt.
+    let server_config = tls::server_config_obf(&bundle)?;
+    let client_config = tls::client_config_obf(&bundle)?;
 
     // ── obfuscated server ────────────────────────────────────────────────
     let server_ep = obf_socket::obfuscated_server_endpoint(

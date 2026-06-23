@@ -69,7 +69,7 @@ fn err(e: anyhow::Error) -> TransportError {
 /// several fixes. Bump on changes that need on-device verification.
 #[uniffi::export]
 pub fn transport_build_marker() -> String {
-    "quic-rt-stats-2026-06-23".to_string()
+    "quic-obf-connect-2026-06-23".to_string()
 }
 
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).
@@ -103,6 +103,28 @@ impl QuicChannel {
         // worker threads for the connection's whole life — not just during this call.
         let inner = on_rt(async move {
             QuicClient::connect(&host, port, &server_name, trust_cert)
+                .await
+                .map_err(err)
+        })
+        .await?;
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
+    }
+
+    /// Like [`connect`](Self::connect) but Salamander-obfuscates every datagram with `psk`
+    /// (the DPI-evading path). The gateway must apply the same PSK; `psk` is provisioned
+    /// out-of-band via the veil-ticket mechanism, never hardcoded.
+    #[uniffi::constructor]
+    pub async fn connect_obfuscated(
+        host: String,
+        port: u16,
+        server_name: String,
+        trust_cert: Vec<u8>,
+        psk: Vec<u8>,
+    ) -> Result<Arc<Self>, TransportError> {
+        let inner = on_rt(async move {
+            QuicClient::connect_obfuscated(&host, port, &server_name, trust_cert, psk)
                 .await
                 .map_err(err)
         })

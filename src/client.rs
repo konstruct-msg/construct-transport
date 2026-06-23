@@ -7,7 +7,7 @@
 //! both ways; h3 0.0.8 also supports client-side `split()` for true full-duplex
 //! (used later by the FFI pump — not needed for the sequential API here).
 
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -17,6 +17,8 @@ use quinn::Endpoint;
 use rustls::pki_types::CertificateDer;
 
 use crate::grpc;
+use crate::obf_socket;
+use crate::salamander::Salamander;
 use crate::tls::{self, CertBundle};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,11 +48,7 @@ impl QuicClient {
         server_name: &str,
         trust_cert: Vec<u8>,
     ) -> Result<Self> {
-        let bundle = CertBundle {
-            cert: CertificateDer::from(trust_cert),
-            key_der: Vec::new(), // client side: private key unused
-        };
-        let client_config = tls::client_config(&bundle)?;
+        let client_config = tls::client_config(&Self::trust_bundle(trust_cert))?;
 
         // Prefer dual-stack IPv6 (NAT64 / IPv6-only LANs), fall back to IPv4.
         let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())
@@ -58,7 +56,51 @@ impl QuicClient {
             .context("bind client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
-        let addr = (host, port)
+        Self::handshake(endpoint, host, port, server_name).await
+    }
+
+    /// Like [`connect`](Self::connect) but every datagram is Salamander-obfuscated with `psk`
+    /// (the gateway must apply the same PSK). Used as the DPI-evading transport path; the
+    /// QUIC MTU is lowered to make room for the per-packet salt. The PSK is provisioned
+    /// out-of-band (veil-ticket), never hardcoded.
+    pub async fn connect_obfuscated(
+        host: &str,
+        port: u16,
+        server_name: &str,
+        trust_cert: Vec<u8>,
+        psk: Vec<u8>,
+    ) -> Result<Self> {
+        let client_config = tls::client_config_obf(&Self::trust_bundle(trust_cert))?;
+
+        // Dual-stack as above, but over a Salamander-obfuscated UDP socket.
+        let obf = Salamander::new(psk);
+        let mut endpoint =
+            obf_socket::obfuscated_client_endpoint("[::]:0".parse().unwrap(), obf.clone())
+                .or_else(|_| {
+                    obf_socket::obfuscated_client_endpoint("0.0.0.0:0".parse().unwrap(), obf)
+                })
+                .context("bind obfuscated client endpoint")?;
+        endpoint.set_default_client_config(client_config);
+
+        Self::handshake(endpoint, host, port, server_name).await
+    }
+
+    fn trust_bundle(trust_cert: Vec<u8>) -> CertBundle {
+        CertBundle {
+            cert: CertificateDer::from(trust_cert),
+            key_der: Vec::new(), // client side: private key unused
+        }
+    }
+
+    /// Resolve `host:port`, run the QUIC handshake on `endpoint`, and start the h3 driver.
+    /// Shared by the plain and obfuscated connect paths — only the endpoint differs.
+    async fn handshake(
+        endpoint: Endpoint,
+        host: &str,
+        port: u16,
+        server_name: &str,
+    ) -> Result<Self> {
+        let addr: SocketAddr = (host, port)
             .to_socket_addrs()
             .with_context(|| format!("resolve {host}:{port}"))?
             .next()

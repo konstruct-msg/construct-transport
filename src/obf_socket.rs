@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, ServerConfig, UdpPoller};
+use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, ServerConfig, UdpPoller};
 use rand::RngCore;
 
 use crate::salamander::{SALT_LEN, Salamander};

@@ -113,9 +113,40 @@ pub fn server_config_tuned(
     Ok(config)
 }
 
+/// Per-datagram obfuscation overhead in bytes (Salamander prepends a salt). The QUIC MTU is
+/// lowered by this amount on obfuscated connections so that the obfuscated datagram
+/// (`QUIC packet || salt`) never exceeds the real path MTU and gets fragmented or dropped.
+pub const OBF_OVERHEAD: u16 = crate::salamander::SALT_LEN as u16;
+
+/// Upper bound quinn's MTU discovery probes to by default. We cap obfuscated connections
+/// `OBF_OVERHEAD` below this so the on-wire datagram stays within `MTUD_UPPER_BOUND`.
+const MTUD_UPPER_BOUND: u16 = 1452;
+
+/// Transport config for an obfuscated connection: same keep-alive/idle as the plain path,
+/// but MTU discovery capped `OBF_OVERHEAD` lower so the salt always fits within the path MTU.
+fn obf_transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)));
+    tc.max_idle_timeout(Some(Duration::from_secs(QUIC_MAX_IDLE_SECS).try_into()?));
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    mtud.upper_bound(MTUD_UPPER_BOUND - OBF_OVERHEAD);
+    tc.mtu_discovery_config(Some(mtud));
+    Ok(Arc::new(tc))
+}
+
 /// Build a quinn client config that trusts exactly `trust` and speaks h3.
 pub fn client_config(trust: &CertBundle) -> Result<quinn::ClientConfig> {
     client_config_tuned(trust, transport_config()?)
+}
+
+/// Like `client_config` but with the MTU lowered for Salamander obfuscation overhead.
+pub fn client_config_obf(trust: &CertBundle) -> Result<quinn::ClientConfig> {
+    client_config_tuned(trust, obf_transport_config()?)
+}
+
+/// Like `server_config` but with the MTU lowered for Salamander obfuscation overhead.
+pub fn server_config_obf(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
+    server_config_tuned(bundle, obf_transport_config()?)
 }
 
 /// Like `client_config` but with a caller-supplied transport config (tests).
