@@ -63,16 +63,23 @@ pub fn load_or_generate(
 }
 
 /// QUIC keep-alive PING interval (seconds). Must stay well below `QUIC_MAX_IDLE_SECS`.
-pub const QUIC_KEEP_ALIVE_SECS: u64 = 10;
+pub const QUIC_KEEP_ALIVE_SECS: u64 = 3;
 /// QUIC max idle timeout (seconds) — connection dies after this much inactivity.
-pub const QUIC_MAX_IDLE_SECS: u64 = 30;
+pub const QUIC_MAX_IDLE_SECS: u64 = 10;
 
 /// Shared QUIC transport tuning. A long-lived gRPC stream (e.g. MessageStream) sits idle
 /// between messages; without an explicit keep-alive the QUIC connection hits the idle
 /// timeout and dies mid-stream (observed device + gateway bug: client "open timed out",
-/// server `recv_data`/`send_trailers: Connection error: Timeout`). A PING every 10s keeps
-/// the connection alive well inside the 30s idle ceiling. Applied to BOTH ends so whichever
-/// side is quiet still refreshes the connection and the negotiated idle timeout is generous.
+/// server `recv_data`/`send_trailers: Connection error: Timeout`).
+///
+/// Tuned tight for **fast failover**: on a network that throttles sustained UDP, an
+/// obfuscated QUIC connection handshakes fine, flows briefly, then the return path is
+/// silently killed. The idle timeout is what detects that, so a 10s ceiling (vs 30s) means
+/// the client gives up on QUIC and falls back to H2/VEIL in ~10s instead of ~30s. A PING
+/// every 3s (3 must be lost before the 10s ceiling) keeps a *healthy* idle connection alive
+/// with margin against ordinary mobile jitter. Applied to BOTH ends; the negotiated idle
+/// timeout is the min of the two. Combined with the client-side fast-UDP cooldown, a network
+/// that kills QUIC is only retried occasionally rather than on every reconnect.
 /// Build a transport config with explicit keep-alive / idle timeouts (exposed so tests
 /// can exercise the keep-alive behaviour with short timeouts).
 pub fn build_transport_config(

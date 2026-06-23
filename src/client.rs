@@ -21,7 +21,10 @@ use crate::obf_socket;
 use crate::salamander::Salamander;
 use crate::tls::{self, CertBundle};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// QUIC connect handshake timeout. Kept short so a network that silently drops the
+/// obfuscated UDP handshake (DPI block) fails over to H2/VEIL fast instead of stalling the
+/// user. A working handshake is ~1 RTT; 3s leaves margin for high-latency-but-working links.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
