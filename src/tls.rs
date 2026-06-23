@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -61,6 +62,19 @@ pub fn load_or_generate(
     Ok(bundle)
 }
 
+/// Shared QUIC transport tuning. A long-lived gRPC stream (e.g. MessageStream) sits idle
+/// between messages; without an explicit keep-alive the QUIC connection hits the idle
+/// timeout and dies mid-stream (observed device + gateway bug: client "open timed out",
+/// server `recv_data`/`send_trailers: Connection error: Timeout`). A PING every 10s keeps
+/// the connection alive well inside the 30s idle ceiling. Applied to BOTH ends so whichever
+/// side is quiet still refreshes the connection and the negotiated idle timeout is generous.
+fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(Duration::from_secs(10)));
+    tc.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+    Ok(Arc::new(tc))
+}
+
 /// Build a quinn server config that presents `bundle` and speaks h3.
 pub fn server_config(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.key_der.clone()));
@@ -69,7 +83,9 @@ pub fn server_config(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
         .with_single_cert(vec![bundle.cert.clone()], key)?;
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let qsc = QuicServerConfig::try_from(tls)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+    config.transport_config(transport_config()?);
+    Ok(config)
 }
 
 /// Build a quinn client config that trusts exactly `trust` and speaks h3.
@@ -81,7 +97,9 @@ pub fn client_config(trust: &CertBundle) -> Result<quinn::ClientConfig> {
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let qcc = QuicClientConfig::try_from(tls)?;
-    Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+    let mut config = quinn::ClientConfig::new(Arc::new(qcc));
+    config.transport_config(transport_config()?);
+    Ok(config)
 }
 
 #[cfg(test)]
