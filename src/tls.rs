@@ -73,15 +73,29 @@ pub const QUIC_MAX_IDLE_SECS: u64 = 30;
 /// server `recv_data`/`send_trailers: Connection error: Timeout`). A PING every 10s keeps
 /// the connection alive well inside the 30s idle ceiling. Applied to BOTH ends so whichever
 /// side is quiet still refreshes the connection and the negotiated idle timeout is generous.
-fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
+/// Build a transport config with explicit keep-alive / idle timeouts (exposed so tests
+/// can exercise the keep-alive behaviour with short timeouts).
+pub fn build_transport_config(keep_alive: Duration, max_idle: Duration) -> Result<Arc<quinn::TransportConfig>> {
     let mut tc = quinn::TransportConfig::default();
-    tc.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)));
-    tc.max_idle_timeout(Some(Duration::from_secs(QUIC_MAX_IDLE_SECS).try_into()?));
+    tc.keep_alive_interval(Some(keep_alive));
+    tc.max_idle_timeout(Some(max_idle.try_into()?));
     Ok(Arc::new(tc))
+}
+
+fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    build_transport_config(
+        Duration::from_secs(QUIC_KEEP_ALIVE_SECS),
+        Duration::from_secs(QUIC_MAX_IDLE_SECS),
+    )
 }
 
 /// Build a quinn server config that presents `bundle` and speaks h3.
 pub fn server_config(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
+    server_config_tuned(bundle, transport_config()?)
+}
+
+/// Like `server_config` but with a caller-supplied transport config (tests).
+pub fn server_config_tuned(bundle: &CertBundle, transport: Arc<quinn::TransportConfig>) -> Result<quinn::ServerConfig> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.key_der.clone()));
     let mut tls = RustlsServerConfig::builder()
         .with_no_client_auth()
@@ -89,12 +103,17 @@ pub fn server_config(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let qsc = QuicServerConfig::try_from(tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    config.transport_config(transport_config()?);
+    config.transport_config(transport);
     Ok(config)
 }
 
 /// Build a quinn client config that trusts exactly `trust` and speaks h3.
 pub fn client_config(trust: &CertBundle) -> Result<quinn::ClientConfig> {
+    client_config_tuned(trust, transport_config()?)
+}
+
+/// Like `client_config` but with a caller-supplied transport config (tests).
+pub fn client_config_tuned(trust: &CertBundle, transport: Arc<quinn::TransportConfig>) -> Result<quinn::ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.add(trust.cert.clone())?;
     let mut tls = RustlsClientConfig::builder()
@@ -103,7 +122,7 @@ pub fn client_config(trust: &CertBundle) -> Result<quinn::ClientConfig> {
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let qcc = QuicClientConfig::try_from(tls)?;
     let mut config = quinn::ClientConfig::new(Arc::new(qcc));
-    config.transport_config(transport_config()?);
+    config.transport_config(transport);
     Ok(config)
 }
 
