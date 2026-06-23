@@ -13,7 +13,9 @@ pub mod client;
 pub mod echo_server;
 pub mod ffi;
 pub mod grpc;
+pub mod obf_socket;
 pub mod proxy;
+pub mod salamander;
 pub mod tls;
 
 uniffi::setup_scaffolding!();

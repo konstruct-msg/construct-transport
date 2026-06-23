@@ -1,6 +1,6 @@
 [package]
 name = "construct-transport"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.85"
@@ -38,6 +38,11 @@ tokio-stream = "0.1"
 # methods; "cli" provides the uniffi-bindgen binary.
 uniffi = { version = "0.30", features = ["tokio", "cli"] }
 thiserror = "2"
+
+# Salamander UDP obfuscation (Hysteria-2 technique): per-packet BLAKE2b-keyed XOR
+# over QUIC datagrams to defeat DPI fingerprinting / SNI extraction.
+blake2 = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 # h2c echo upstream (stands in for envoy) in the proxy integration test

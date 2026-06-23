@@ -33,7 +33,12 @@ pub async fn spawn_echo_server(
     server_config: quinn::ServerConfig,
     bind: SocketAddr,
 ) -> Result<ServerHandle> {
-    let endpoint = Endpoint::server(server_config, bind)?;
+    spawn_echo_on_endpoint(Endpoint::server(server_config, bind)?)
+}
+
+/// Run the echo accept-loop on a pre-built endpoint — lets callers inject a custom
+/// `AsyncUdpSocket` (e.g. the Salamander-obfuscated socket) before handing it over.
+pub fn spawn_echo_on_endpoint(endpoint: Endpoint) -> Result<ServerHandle> {
     let addr = endpoint.local_addr()?;
     let accept_ep = endpoint.clone();
     let task = tokio::spawn(async move {
