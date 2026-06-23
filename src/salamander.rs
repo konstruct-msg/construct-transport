@@ -10,7 +10,7 @@
 //!   * per-packet `salt` = 8 random bytes,
 //!   * `key = BLAKE2b-256(psk ‖ salt)` (32 bytes),
 //!   * `out = salt ‖ (plain[i] ^ key[i % 32])` — repeating-key XOR, fresh key every packet.
-//! Overhead is the 8-byte salt; there is no auth tag.
+//!     Overhead is the 8-byte salt; there is no auth tag.
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};

@@ -26,7 +26,7 @@ fn obfuscated_endpoint(
     server_config: Option<ServerConfig>,
 ) -> io::Result<Endpoint> {
     let runtime = quinn::default_runtime().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "no async runtime for QUIC endpoint")
+        io::Error::other("no async runtime for QUIC endpoint")
     })?;
     let std_socket = std::net::UdpSocket::bind(bind)?;
     let inner = runtime.wrap_udp_socket(std_socket)?;
