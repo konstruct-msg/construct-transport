@@ -69,7 +69,7 @@ fn err(e: anyhow::Error) -> TransportError {
 /// several fixes. Bump on changes that need on-device verification.
 #[uniffi::export]
 pub fn transport_build_marker() -> String {
-    "quic-fast-fallback-2026-06-23".to_string()
+    "quic-plain-relaxed-keepalive-2026-06-24".to_string()
 }
 
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).

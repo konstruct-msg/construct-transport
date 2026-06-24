@@ -63,23 +63,24 @@ pub fn load_or_generate(
 }
 
 /// QUIC keep-alive PING interval (seconds). Must stay well below `QUIC_MAX_IDLE_SECS`.
-pub const QUIC_KEEP_ALIVE_SECS: u64 = 3;
+pub const QUIC_KEEP_ALIVE_SECS: u64 = 15;
 /// QUIC max idle timeout (seconds) — connection dies after this much inactivity.
-pub const QUIC_MAX_IDLE_SECS: u64 = 10;
+pub const QUIC_MAX_IDLE_SECS: u64 = 30;
 
 /// Shared QUIC transport tuning. A long-lived gRPC stream (e.g. MessageStream) sits idle
 /// between messages; without an explicit keep-alive the QUIC connection hits the idle
 /// timeout and dies mid-stream (observed device + gateway bug: client "open timed out",
 /// server `recv_data`/`send_trailers: Connection error: Timeout`).
 ///
-/// Tuned tight for **fast failover**: on a network that throttles sustained UDP, an
-/// obfuscated QUIC connection handshakes fine, flows briefly, then the return path is
-/// silently killed. The idle timeout is what detects that, so a 10s ceiling (vs 30s) means
-/// the client gives up on QUIC and falls back to H2/VEIL in ~10s instead of ~30s. A PING
-/// every 3s (3 must be lost before the 10s ceiling) keeps a *healthy* idle connection alive
-/// with margin against ordinary mobile jitter. Applied to BOTH ends; the negotiated idle
-/// timeout is the min of the two. Combined with the client-side fast-UDP cooldown, a network
-/// that kills QUIC is only retried occasionally rather than on every reconnect.
+/// Tuned for **battery**, not aggressive failover. QUIC is now proven stable on
+/// uncensored networks (NL testers), so we no longer need a tight idle ceiling to bail
+/// out fast — the cost of that (a PING every 3s) drained battery under a system VPN,
+/// where every keep-alive packet is double-encrypted and keeps the radio warm. A PING
+/// every 15s with a 30s idle ceiling cuts radio wake-ups ~5× while still keeping a
+/// *healthy* idle connection alive with margin against mobile jitter. Fast *connect*
+/// failover is unchanged: `HANDSHAKE_TIMEOUT` (3s, client.rs) still bails out of a
+/// dead handshake quickly; only mid-stream death detection relaxes to ≤30s. Applied to
+/// BOTH ends; the negotiated idle timeout is the min of the two.
 /// Build a transport config with explicit keep-alive / idle timeouts (exposed so tests
 /// can exercise the keep-alive behaviour with short timeouts).
 pub fn build_transport_config(
