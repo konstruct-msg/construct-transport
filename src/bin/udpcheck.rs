@@ -26,10 +26,18 @@
 //! Server-cert validation is otherwise SKIPPED (reachability only). For a full
 //! validated bidi roundtrip use the `probe` bin (needs the server-cert.der).
 //!
+//! `--sni <name>` overrides the SNI our probe presents (still dialing our gateway's IP) — the
+//! SNI-vs-IP discriminator: if a benign SNI survives `--hold` where the real one dies, the block
+//! is keyed on SNI, not destination IP. `--psk <hex>` Salamander-obfuscates our datagrams (must
+//! match the gateway's `QUIC_OBF_PSK` listener) — if that survives where plain QUIC dies, hiding
+//! the fact that it's QUIC defeats the block. Both apply to OUR gateway only; control stays clean.
+//!
 //! Usage:
 //!   cargo run --bin udpcheck                          # control + quic.konstruct.cc:443
 //!   cargo run --bin udpcheck -- --hold 30             # + hold each conn 30s
 //!   cargo run --bin udpcheck -- --pin quic_gateway.der   # pin ours like the app
+//!   cargo run --bin udpcheck -- --sni www.google.com --hold 60   # SNI-vs-IP test (no server change)
+//!   cargo run --bin udpcheck -- --psk <hex> quic.konstruct.cc 8443 --hold 60  # Salamander test
 //!   cargo run --bin udpcheck -- quic.example.com 443 --hold 30 --pin cert.der
 
 use std::net::ToSocketAddrs;
@@ -37,6 +45,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use construct_transport::obf_socket::obfuscated_client_endpoint;
+use construct_transport::salamander::{SALT_LEN, Salamander};
 use quinn::Endpoint;
 use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
@@ -125,7 +135,18 @@ impl ServerCertVerifier for Verifier {
     }
 }
 
-fn client_config(pin: Option<Vec<u8>>) -> Result<(quinn::ClientConfig, Arc<Verifier>)> {
+/// Decode a hex string (the Salamander PSK from `--psk`) into bytes.
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(s.len().is_multiple_of(2), "hex PSK must have even length");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!("invalid hex: {e}"))
+        })
+        .collect()
+}
+
+fn client_config(pin: Option<Vec<u8>>, obf: bool) -> Result<(quinn::ClientConfig, Arc<Verifier>)> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(Verifier {
         provider: provider.clone(),
@@ -148,6 +169,13 @@ fn client_config(pin: Option<Vec<u8>>) -> Result<(quinn::ClientConfig, Arc<Verif
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    if obf {
+        // Salamander prepends an 8-byte salt to every datagram; cap MTU discovery so the
+        // obfuscated packet (QUIC || salt) stays within the path MTU (mirrors tls.rs obf cfg).
+        let mut mtud = quinn::MtuDiscoveryConfig::default();
+        mtud.upper_bound(1452 - SALT_LEN as u16);
+        transport.mtu_discovery_config(Some(mtud));
+    }
     cfg.transport_config(Arc::new(transport));
     Ok((cfg, verifier))
 }
@@ -169,8 +197,15 @@ enum Probe {
 
 /// One QUIC handshake to `host:port`; if `hold > 0`, keep it open that long and
 /// watch for a network-induced drop.
-async fn try_quic(host: &str, port: u16, pin: Option<Vec<u8>>, hold: Duration) -> Probe {
-    match try_quic_inner(host, port, pin, hold).await {
+async fn try_quic(
+    host: &str,
+    port: u16,
+    pin: Option<Vec<u8>>,
+    hold: Duration,
+    sni: Option<String>,
+    psk: Option<Vec<u8>>,
+) -> Probe {
+    match try_quic_inner(host, port, pin, hold, sni, psk).await {
         Ok(p) => p,
         Err(e) => Probe::Fail(format!("{e}")),
     }
@@ -181,6 +216,8 @@ async fn try_quic_inner(
     port: u16,
     pin: Option<Vec<u8>>,
     hold: Duration,
+    sni: Option<String>,
+    psk: Option<Vec<u8>>,
 ) -> Result<Probe> {
     let addr = format!("{host}:{port}")
         .to_socket_addrs()
@@ -196,11 +233,19 @@ async fn try_quic_inner(
     } else {
         "0.0.0.0:0".parse()?
     };
-    let (cfg, verifier) = client_config(pin)?;
-    let mut endpoint = Endpoint::client(bind)?;
+    let (cfg, verifier) = client_config(pin, psk.is_some())?;
+    let mut endpoint = match psk {
+        Some(psk) => obfuscated_client_endpoint(bind, Salamander::new(psk))
+            .context("bind Salamander-obfuscated client endpoint")?,
+        None => Endpoint::client(bind)?,
+    };
     endpoint.set_default_client_config(cfg);
 
-    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.connect(addr, host)?)
+    // SNI presented in the (QUIC Initial) ClientHello. Overriding it while still dialing our
+    // gateway's IP is the SNI-vs-IP discriminator: a benign SNI surviving where the real one
+    // dies means the block is keyed on SNI, not destination IP.
+    let server_name = sni.as_deref().unwrap_or(host);
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.connect(addr, server_name)?)
         .await
         .context("QUIC handshake timed out — UDP/443 is filtered or throttled on this path")??;
     let rtt = conn.rtt();
@@ -276,6 +321,8 @@ async fn main() -> Result<()> {
     // Parse `[host] [port]` positionals + optional `--hold <secs>` and `--pin <cert.der>`.
     let mut hold_secs: u64 = 0;
     let mut pin_path: Option<String> = None;
+    let mut sni: Option<String> = None;
+    let mut psk: Option<Vec<u8>> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -289,6 +336,16 @@ async fn main() -> Result<()> {
             }
             "--pin" => {
                 pin_path = Some(it.next().context("--pin needs a path to a cert.der")?);
+            }
+            // Override the SNI our probe presents (SNI-vs-IP discriminator). Applies to `ours`.
+            "--sni" => {
+                sni = Some(it.next().context("--sni needs a server name")?);
+            }
+            // Salamander-obfuscate our datagrams with this hex PSK (must match the gateway's
+            // QUIC_OBF_PSK). Applies to `ours`. Tests whether hiding QUIC defeats the block.
+            "--psk" => {
+                let hex = it.next().context("--psk needs a hex PSK")?;
+                psk = Some(decode_hex(&hex).context("invalid --psk hex")?);
             }
             // Standard end-of-options separator; harmless when run directly as
             // `udpcheck -- --hold 30`. Never mistake it for the host.
@@ -317,20 +374,36 @@ async fn main() -> Result<()> {
     if let Some(p) = &pin_path {
         println!("(pinning our gateway to {p}, exactly like the app)");
     }
+    if let Some(s) = &sni {
+        println!("(overriding OUR SNI → \"{s}\" while dialing {ours_host}'s IP — SNI-vs-IP test)");
+    }
+    if psk.is_some() {
+        println!("(Salamander-obfuscating OUR datagrams — tests if hiding QUIC defeats the block)");
+    }
     println!();
 
-    // Control is never pinned (public cert); ours is pinned iff --pin was given.
+    // Control is always plain + real SNI (public cert, never pinned). The --sni / --psk
+    // overrides apply ONLY to our gateway, so control stays a clean baseline.
     print!("Control  ({CONTROL_HOST}:{CONTROL_PORT}, public HTTP/3) ... ");
-    let control = try_quic(CONTROL_HOST, CONTROL_PORT, None, hold).await;
+    let control = try_quic(CONTROL_HOST, CONTROL_PORT, None, hold, None, None).await;
     let control_ok = report(&control, hold);
 
     print!("Ours     ({ours_host}:{ours_port}) ... ");
-    let ours = try_quic(&ours_host, ours_port, pin, hold).await;
+    let ours = try_quic(&ours_host, ours_port, pin, hold, sni.clone(), psk.clone()).await;
     let ours_ok = report(&ours, hold);
 
     let ours_throttled = matches!(ours, Probe::Throttled { .. });
     let control_throttled = matches!(control, Probe::Throttled { .. });
     let pin_mismatch = matches!(&ours, Probe::Fail(e) if e.contains("pinned cert mismatch"));
+    // With --sni or --psk, `ours` is a targeting-mechanism discriminator (does hiding the SNI /
+    // obfuscating QUIC defeat the block?), not a plain reachability check — interpret separately.
+    let mode = if psk.is_some() {
+        Some("Salamander obfuscation")
+    } else if sni.is_some() {
+        Some("SNI spoofing")
+    } else {
+        None
+    };
 
     println!("\n{}", "─".repeat(62));
     if pin_mismatch {
@@ -338,20 +411,72 @@ async fn main() -> Result<()> {
         println!("         quic_gateway.der. The gateway cert was rotated and the app's");
         println!("         bundled pin is STALE → the app's QUIC fails while the network is");
         println!("         fine. Fix = re-bundle the current gateway cert. (This is our bug.)");
+    } else if let Some(mode) = mode {
+        match &ours {
+            Probe::Ok { .. } => {
+                println!("VERDICT: with {mode}, OUR gateway SURVIVED where plain QUIC to it dies.");
+                println!(
+                    "         → the block is DEFEATED at this layer. --sni surviving ⇒ targeting"
+                );
+                println!(
+                    "         is by SNI (hide/spoof it). --psk surviving ⇒ hiding that it's QUIC"
+                );
+                println!(
+                    "         works ⇒ Salamander is a viable RU transport; ship it for censored"
+                );
+                println!(
+                    "         nets. (Compare with a plain run to the SAME port to rule out port.)"
+                );
+            }
+            Probe::Throttled { died_after, .. } => {
+                println!(
+                    "VERDICT: {mode} did NOT help — our gateway still died after {died_after:?}."
+                );
+                println!(
+                    "         → the block is DEEPER than this layer. --sni failing ⇒ NOT SNI-keyed"
+                );
+                println!(
+                    "         (destination-IP or QUIC-fingerprint). --psk failing ⇒ even hiding"
+                );
+                println!(
+                    "         QUIC fails ⇒ IP-level block ⇒ need fronting/relays (veil-front)."
+                );
+            }
+            Probe::Fail(e) => {
+                println!("VERDICT: with {mode}, the handshake to our gateway FAILED: {e}");
+                println!("         Check the gateway serves this mode on {ours_host}:{ours_port}");
+                println!("         (--psk needs the matching QUIC_OBF_PSK listener; --sni needs a");
+                println!(
+                    "         plain listener). Control was {}.",
+                    if control_ok { "OK" } else { "also down" }
+                );
+            }
+        }
     } else {
         match (control_ok, ours_ok) {
-            (true, true) if ours_throttled || control_throttled => {
+            (true, true) if ours_throttled && !control_throttled => {
                 println!(
-                    "VERDICT: QUIC HANDSHAKES succeed but a sustained connection gets KILLED on"
+                    "VERDICT: the public control SURVIVED but OUR gateway was KILLED mid-connection."
                 );
                 println!(
-                    "         this network — the classic DPI throttle of long-lived UDP/QUIC."
+                    "         QUIC/UDP works on this network — the throttle is TARGETED at our"
                 );
                 println!(
-                    "         This is why the app's message stream drops mid-session and falls"
+                    "         endpoint (by SNI or destination IP), not a generic UDP block. Re-run"
                 );
                 println!(
-                    "         back to HTTP/2. Network-level, not our config. Please send this."
+                    "         with --sni <benign> and/or --psk <key> to find which. App uses H2 meanwhile."
+                );
+            }
+            (true, true) if control_throttled => {
+                println!(
+                    "VERDICT: even the public control was KILLED mid-connection — this network"
+                );
+                println!(
+                    "         throttles ALL long-lived UDP/QUIC (generic DPI). The app falls back"
+                );
+                println!(
+                    "         to HTTP/2 (works). Network-level, not our config. Please send this."
                 );
             }
             (true, true) => {

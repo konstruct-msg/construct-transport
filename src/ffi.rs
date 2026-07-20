@@ -9,33 +9,20 @@
 //!
 //! The Swift gRPC-swift `ClientTransport` adapter sits directly on this.
 //!
-//! ## Why every operation runs on a dedicated, continuously-driven runtime (`RT`)
+//! ## Why every operation runs on a dedicated runtime (`RT`)
 //!
 //! quinn drives a connection's I/O — including the keep-alive timer, outgoing-packet
-//! flushing, and incoming-packet processing — from a background driver task owned by the
-//! endpoint. That task only makes progress while the runtime's I/O + time reactor is being
-//! actively pumped. UniFFI's `async_runtime = "tokio"` only drives the *specific exported
-//! future* the foreign side is awaiting; it does NOT keep the reactor running between calls.
-//! So on iOS the connection worked for the first exchange (while `connect`/`recv` were
-//! actively polled) and then froze: once every FFI call parked, nothing pumped the reactor,
-//! so no keep-alive PINGs went out, queued sends never flushed, and incoming packets were
-//! never processed — the connection idle-timed out at ~30s (client "open timed out" / gateway
-//! "h3 recv_data: Timeout").
-//!
-//! The 2026-06-23 fix moved all work onto a dedicated **multi-thread** runtime, which fixed
-//! the *active-flush* starvation but NOT idle: a multi-thread runtime only pumps its reactor
-//! when a worker parks, and on iOS that cooperative park→reactor path does not keep the
-//! endpoint driver's keep-alive timer / socket recv alive through a long idle window. Device
-//! telemetry (`connection_stats`) proved it: `ping_tx` frozen (keep-alive never fires) and
-//! `rx_pkts` frozen (socket never read) while `tx_pkts` grew only on explicit `send_message`.
-//!
-//! The 2026-07-20 fix (this code) switches to the standard **persistent background runtime**
-//! idiom: a `current_thread` runtime driven forever by one dedicated OS thread holding
-//! `block_on(pending())`. That thread continuously advances the reactor (kqueue + timer
-//! wheel), so quinn's endpoint driver, keep-alive timer, and socket recv always make progress
-//! independent of how UniFFI polls the exported futures. Verify on-device: `QUIC stats`
-//! `ping_tx` must grow and `rx_pkts` advance over an idle window; the idle MessageStream must
-//! survive well past 30s. Low CPU — the thread parks on kqueue between events/timers.
+//! flushing, and incoming-packet processing — from background tasks (`tokio::spawn`) owned
+//! by the endpoint driver. Those tasks only make progress while a tokio runtime with live
+//! worker threads is polling them. UniFFI's `async_runtime = "tokio"` only drives the
+//! *specific exported future* the foreign side is awaiting; it does NOT keep spawned
+//! background tasks running between calls. So on iOS the connection worked for the first
+//! exchange (while `connect`/`recv` were actively polled) and then froze: a parked
+//! `recv_message` left the endpoint driver starved, so no keep-alive PINGs went out, queued
+//! sends never flushed, and incoming packets were never processed — the connection idle-timed
+//! out at ~30s (client "open timed out" / gateway "h3 recv_data: Timeout"). Mirrors the
+//! construct-engine fix: own a multi-thread runtime and run all QUIC work on it so the
+//! drivers always have worker threads. (Verified via device + gateway debug logs 2026-06-23.)
 
 use std::sync::{Arc, LazyLock};
 
@@ -43,28 +30,16 @@ use tokio::sync::Mutex;
 
 use crate::client::{QuicClient, QuicRecvStream, QuicSendStream};
 
-/// Dedicated tokio runtime that owns all QUIC/h3 work, driven **continuously** by one
-/// background thread so quinn's endpoint driver (keep-alive, flush, recv) always makes
-/// progress — independent of how UniFFI polls the exported futures. A `current_thread`
-/// runtime advances spawned tasks and its I/O/time reactor only while something is being
-/// `block_on`'d; the dedicated thread holds that `block_on` for the process lifetime. See
-/// module docs for why the previous multi-thread runtime did not keep idle keep-alive alive
-/// on iOS.
-static RT: LazyLock<tokio::runtime::Handle> = LazyLock::new(|| {
-    let rt = tokio::runtime::Builder::new_current_thread()
+/// Dedicated multi-thread runtime that owns all QUIC/h3 work, so quinn's endpoint/connection
+/// drivers (keep-alive, flush, recv) always have live worker threads — independent of how
+/// UniFFI polls the exported futures. See module docs.
+static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("construct-transport")
         .enable_all()
         .build()
-        .expect("build construct-transport tokio runtime");
-    let handle = rt.handle().clone();
-    std::thread::Builder::new()
-        .name("construct-transport".into())
-        .spawn(move || {
-            // Hold the runtime open forever so its reactor + all spawned QUIC tasks are
-            // driven for the whole process life. Parks on kqueue between events (low CPU).
-            rt.block_on(std::future::pending::<()>());
-        })
-        .expect("spawn construct-transport runtime thread");
-    handle
+        .expect("build construct-transport tokio runtime")
 });
 
 /// Run `fut` on the dedicated runtime and await its result on the caller's (UniFFI) runtime.
@@ -94,7 +69,7 @@ fn err(e: anyhow::Error) -> TransportError {
 /// several fixes. Bump on changes that need on-device verification.
 #[uniffi::export]
 pub fn transport_build_marker() -> String {
-    "quic-idle-drive-current-thread-2026-07-20".to_string()
+    "quic-plain-relaxed-keepalive-2026-06-24".to_string()
 }
 
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).
