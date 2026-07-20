@@ -5,11 +5,11 @@
 //! work":
 //!
 //!   * control fails            → this network throttles/blocks UDP/443 (QUIC).
-//!                                Network-level censorship — the app falls back
-//!                                to HTTP/2 (which works). NOT our bug.
+//!     Network-level censorship — the app falls back
+//!     to HTTP/2 (which works). NOT our bug.
 //!   * control OK, ours fails   → UDP/443 works on this network but our gateway
-//!                                didn't answer → our config/server, or a block
-//!                                targeted at our SNI. Please send us the output.
+//!     didn't answer → our config/server, or a block
+//!     targeted at our SNI. Please send us the output.
 //!   * both OK                  → QUIC/UDP reaches us end-to-end on this network.
 //!
 //! `--hold <secs>` keeps each connection open (with keep-alive) after the
@@ -79,13 +79,13 @@ impl ServerCertVerifier for Verifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         let digest = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
         *self.seen_fp.lock().unwrap() = Some(hex_fp(digest.as_ref()));
-        if let Some(pin) = &self.pin {
-            if end_entity.as_ref() != pin.as_slice() {
-                return Err(rustls::Error::General(
-                    "pinned cert mismatch — gateway cert differs from the bundled quic_gateway.der"
-                        .into(),
-                ));
-            }
+        if let Some(pin) = &self.pin
+            && end_entity.as_ref() != pin.as_slice()
+        {
+            return Err(rustls::Error::General(
+                "pinned cert mismatch — gateway cert differs from the bundled quic_gateway.der"
+                    .into(),
+            ));
         }
         Ok(ServerCertVerified::assertion())
     }
