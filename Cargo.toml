@@ -1,10 +1,10 @@
 [package]
 name = "construct-transport"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.88"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/construct-msg/construct-transport"
 
 # Phase 0 diagnostic spike: prove bidi gRPC-over-HTTP/3 works on a native
@@ -43,6 +43,10 @@ thiserror = "2"
 # over QUIC datagrams to defeat DPI fingerprinting / SNI extraction.
 blake2 = "0.10"
 rand = "0.8"
+
+# SHA-256 of the server leaf cert for the udpcheck fingerprint/pin diagnostic
+# (already in the tree transitively via rustls/quinn).
+ring = "0.17"
 
 [dev-dependencies]
 # h2c echo upstream (stands in for envoy) in the proxy integration test
