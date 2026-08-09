@@ -101,10 +101,13 @@ generate_bindings() {
   hdr "UniFFI Swift bindings"
   cd "$TRANSPORT_ROOT"
   local host_dylib="$TRANSPORT_ROOT/target/debug/$LIB.dylib"
-  if [ ! -f "$host_dylib" ]; then
-    info "Building host dylib for UniFFI metadata…"
-    cargo build --lib 2>&1 | grep -E "^error|Finished" || true
-  fi
+  # ALWAYS rebuild. This used to be `if [ ! -f ... ]`, which silently generated bindings from
+  # whatever dylib happened to be on disk: on 2026-08-09 two newly exported functions were
+  # missing from construct_transport.swift while sitting in the .a, and the build reported
+  # success both times. Same class of trap as the cached static lib `transport_build_marker`
+  # exists to catch — cargo makes the no-op case cheap, so there is nothing to save here.
+  info "Building host dylib for UniFFI metadata…"
+  cargo build --lib 2>&1 | grep -E "^error|Finished" || true
   [ -f "$host_dylib" ] || fail "host dylib not found: $host_dylib"
 
   "${BINDGEN[@]}" generate \

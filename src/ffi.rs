@@ -152,6 +152,16 @@ impl QuicChannel {
         }))
     }
 
+    /// Close this connection now, rather than when the last Swift reference happens to go away.
+    ///
+    /// Until 2026-08-09 this API had no way to close a connection at all — teardown was a side
+    /// effect of drop order inside quinn and h3. That does work (verified by mutation, see
+    /// `QuicClient::drop`), but it is not something this crate states or can hold a dependency
+    /// to. This makes retirement explicit.
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
     /// Diagnostic: live quinn connection stats (tx/rx datagrams, PING frames sent, RTT,
     /// close reason). Runs on `RT`, so it also proves the dedicated runtime is responsive.
     /// `ping_tx` not growing over time ⇒ keep-alive isn't firing.
@@ -159,6 +169,33 @@ impl QuicChannel {
         let client = self.inner.clone();
         on_rt(async move { Ok(client.stats_string()) }).await
     }
+}
+
+/// Health of the transport runtime itself: open connections and live tokio tasks.
+///
+/// Both numbers exist to settle a question the 2026-08-09 device logs could not: the runtime
+/// pins one worker thread at 100% (`cpu=105.5%` to the decimal across many 30s windows) and
+/// keeps it there, while QUIC is disabled and every stream runs over H2 — so it is neither a
+/// live connection nor traffic. `alive_tasks` separates the two remaining shapes: one task that
+/// never yields, versus tasks that accumulate and are never reaped. Reading a stack is the next
+/// step either way, but this says which stack to go looking for.
+#[uniffi::export]
+pub fn transport_runtime_stats() -> String {
+    format!(
+        "conns={} tasks={}",
+        crate::client::live_connections(),
+        RT.metrics().num_alive_tasks(),
+    )
+}
+
+/// How many QUIC connections this process holds open right now.
+///
+/// Belongs in every runtime health line on device. This number was unobservable while abandoned
+/// connections were accumulating, which is why "the transport burns a core" took a day to see
+/// and could not be attributed to anything.
+#[uniffi::export]
+pub fn transport_live_connections() -> u32 {
+    crate::client::live_connections()
 }
 
 /// One gRPC call. Send and receive halves are independently locked, so a Swift

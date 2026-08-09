@@ -8,6 +8,7 @@
 //! (used later by the FFI pump — not needed for the sequential API here).
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -31,13 +32,51 @@ type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Byt
 type H3SendHalf = h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>;
 type H3RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>;
 
+/// Live `QuicClient` count. A gauge, not a statistic: an abandoned connection used to be
+/// invisible, and on device it was the difference between 13% and 106% CPU.
+static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many QUIC connections this process currently holds open.
+pub fn live_connections() -> u32 {
+    LIVE_CONNECTIONS.load(Ordering::Relaxed) as u32
+}
+
 /// One QUIC/HTTP-3 connection to a gateway. Cheap to open streams from.
+///
+/// Dropping this closes the connection — see the `Drop` impl. That is not the default
+/// behaviour of the parts it is built from, and the difference cost a day of device logs.
 pub struct QuicClient {
     _endpoint: Endpoint,
     send_request: H3SendRequest,
     authority: String,
     conn: quinn::Connection,
-    _driver: tokio::task::JoinHandle<()>,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for QuicClient {
+    /// Explicit teardown and the gauge decrement.
+    ///
+    /// HONEST SCOPE — do not cite this as the fix for the 2026-08-09 heat incident. It was
+    /// written on the theory that abandoned connections accumulated (a `JoinHandle` drop detaches
+    /// rather than cancels; an `Endpoint` drop does not close its connections; keep-alive at 15s
+    /// beats the 30s idle timeout, so an orphan could never expire). Mutation testing refuted it:
+    /// with this whole body emptied, `tests/connection_teardown.rs` stays green — including the
+    /// case where a stream is still held. Dropping the client already closes the connection.
+    ///
+    /// What remains true and worth keeping:
+    ///   * `driver.abort()` — a detached task is a real leak even when the connection closes;
+    ///   * `conn.close()` — states the intent at the peer instead of relying on handle-drop
+    ///     order inside two dependencies;
+    ///   * the gauge — the only way to test the accumulation theory on a device rather than
+    ///     against a loopback echo server.
+    ///
+    /// The device symptom (`cpu=106% hot=[construct-transport:100%]` for as long as the app is
+    /// foregrounded, against 13% on a fresh single-connection session) is NOT explained yet.
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"client dropped");
+        self.driver.abort();
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl QuicClient {
@@ -123,13 +162,30 @@ impl QuicClient {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
+        LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             _endpoint: endpoint,
             send_request,
             authority: server_name.to_string(),
             conn: conn_for_stats,
-            _driver: driver_task,
+            driver: driver_task,
         })
+    }
+
+    /// A clone of the quinn connection handle, for observing state (`close_reason`) after this
+    /// client is gone. Test/diagnostic use — it does not keep the connection open on its own.
+    pub fn connection_handle(&self) -> quinn::Connection {
+        self.conn.clone()
+    }
+
+    /// Close the connection now, without waiting for every reference to go away.
+    ///
+    /// `Drop` does this too, but an open `QuicStream` holds the connection alive, so a caller
+    /// that abandons a channel while a stream is still parked on `recv_message` would otherwise
+    /// keep the whole thing running. Idempotent — quinn ignores a second close.
+    pub fn close(&self) {
+        self.conn.close(0u32.into(), b"client closed");
+        self.driver.abort();
     }
 
     /// Diagnostic snapshot of the live quinn connection. `ping` is the count of
