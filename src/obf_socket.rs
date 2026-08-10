@@ -18,6 +18,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, ServerConfig, UdpPoller};
 use rand::RngCore;
 
+use crate::spin_free_socket::SpinFreeUdpSocket;
 use crate::salamander::{SALT_LEN, Salamander};
 
 fn obfuscated_endpoint(
@@ -28,7 +29,10 @@ fn obfuscated_endpoint(
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime for QUIC endpoint"))?;
     let std_socket = std::net::UdpSocket::bind(bind)?;
-    let inner = runtime.wrap_udp_socket(std_socket)?;
+    // NOT `runtime.wrap_udp_socket`: quinn's own socket spins a core when recvmsg reports an
+    // error other than WouldBlock (see spin_free_socket). This path delegates poll_recv straight
+    // to the inner socket, so it inherits whichever bug the inner socket has.
+    let inner: Arc<dyn AsyncUdpSocket> = Arc::new(SpinFreeUdpSocket::wrap(std_socket)?);
     let socket = Arc::new(ObfuscatedUdpSocket::new(inner, obf));
     Endpoint::new_with_abstract_socket(EndpointConfig::default(), server_config, socket, runtime)
 }

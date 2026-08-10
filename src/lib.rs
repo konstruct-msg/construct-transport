@@ -16,6 +16,7 @@ pub mod grpc;
 pub mod obf_socket;
 pub mod proxy;
 pub mod salamander;
+pub mod spin_free_socket;
 pub mod tls;
 
 uniffi::setup_scaffolding!();

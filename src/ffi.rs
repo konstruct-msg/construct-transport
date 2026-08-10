@@ -181,10 +181,15 @@ impl QuicChannel {
 /// step either way, but this says which stack to go looking for.
 #[uniffi::export]
 pub fn transport_runtime_stats() -> String {
+    // `udperr` is the count of receive errors absorbed without spinning the endpoint driver
+    // (see spin_free_socket). It is expected to be non-zero on a network that returns ICMP
+    // unreachables — that is the condition that used to cost a core. A growing `udperr` next to
+    // low CPU is the fix working; a growing `udperr` next to 100% CPU means it is not.
     format!(
-        "conns={} tasks={}",
+        "conns={} tasks={} udperr={}",
         crate::client::live_connections(),
         RT.metrics().num_alive_tasks(),
+        crate::spin_free_socket::suppressed_socket_errors(),
     )
 }
 

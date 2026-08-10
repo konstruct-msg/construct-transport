@@ -8,6 +8,7 @@
 //! (used later by the FFI pump — not needed for the sequential API here).
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use rustls::pki_types::CertificateDer;
 use crate::grpc;
 use crate::obf_socket;
 use crate::salamander::Salamander;
+use crate::spin_free_socket::SpinFreeUdpSocket;
 use crate::tls::{self, CertBundle};
 
 /// QUIC connect handshake timeout. Kept short so a network that silently drops the
@@ -97,8 +99,8 @@ impl QuicClient {
         let client_config = tls::client_config(&Self::trust_bundle(trust_cert))?;
 
         // Prefer dual-stack IPv6 (NAT64 / IPv6-only LANs), fall back to IPv4.
-        let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())
-            .or_else(|_| Endpoint::client("0.0.0.0:0".parse().unwrap()))
+        let mut endpoint = Self::bind_endpoint("[::]:0".parse().unwrap())
+            .or_else(|_| Self::bind_endpoint("0.0.0.0:0".parse().unwrap()))
             .context("bind client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
@@ -129,6 +131,25 @@ impl QuicClient {
         endpoint.set_default_client_config(client_config);
 
         Self::handshake(endpoint, host, port, server_name).await
+    }
+
+    /// Bind a client endpoint on our own socket rather than `Endpoint::client`.
+    ///
+    /// `Endpoint::client` wraps quinn's tokio socket, whose `poll_recv` re-polls immediately on
+    /// any receive error that is not `WouldBlock` — which pins a CPU core while the connection
+    /// itself keeps working. This is the plain path, and it is the one the device burned on:
+    /// `transport=conns=1 tasks=5`, 111% CPU, thermal `serious`, 1.43 min of `__recvmsg` in a
+    /// 1.59 min trace. See `spin_free_socket`.
+    fn bind_endpoint(addr: std::net::SocketAddr) -> Result<Endpoint> {
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC endpoint"))?;
+        let socket = Arc::new(SpinFreeUdpSocket::bind(addr)?);
+        Ok(Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )?)
     }
 
     fn trust_bundle(trust_cert: Vec<u8>) -> CertBundle {
