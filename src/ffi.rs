@@ -188,6 +188,15 @@ pub fn transport_runtime_stats() -> String {
     )
 }
 
+/// Live tokio tasks on the transport runtime.
+///
+/// Plain Rust (not exported over UniFFI — `transport_runtime_stats` is the FFI surface). Exists
+/// so a test can assert the runtime drains, which is the property the device could only report
+/// as a number: `conns=0 tasks=1` while a worker thread sat at 100%.
+pub fn runtime_alive_tasks() -> usize {
+    RT.metrics().num_alive_tasks()
+}
+
 /// How many QUIC connections this process holds open right now.
 ///
 /// Belongs in every runtime health line on device. This number was unobservable while abandoned
