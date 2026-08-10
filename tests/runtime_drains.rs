@@ -34,9 +34,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use construct_transport::{
-    client::{live_connections, QuicClient},
+    client::{QuicClient, live_connections},
     echo_server,
-    ffi::{runtime_alive_tasks, QuicChannel},
+    ffi::{QuicChannel, runtime_alive_tasks},
     tls,
 };
 
@@ -75,14 +75,10 @@ async fn the_runtime_drains_after_the_last_connection_is_dropped() -> Result<()>
 
     let baseline = runtime_alive_tasks();
 
-    let channel = QuicChannel::connect(
-        "127.0.0.1".to_string(),
-        port,
-        "localhost".to_string(),
-        cert,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let channel =
+        QuicChannel::connect("127.0.0.1".to_string(), port, "localhost".to_string(), cert)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
     assert_eq!(live_connections(), 1, "one connection is open");
 
@@ -113,14 +109,10 @@ async fn the_runtime_drains_after_a_stream_was_used() -> Result<()> {
 
     let baseline = runtime_alive_tasks();
 
-    let channel = QuicChannel::connect(
-        "127.0.0.1".to_string(),
-        port,
-        "localhost".to_string(),
-        cert,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let channel =
+        QuicChannel::connect("127.0.0.1".to_string(), port, "localhost".to_string(), cert)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
     let stream = channel
         .open_stream("/construct.Echo/BiDi".to_string(), vec![])
@@ -172,8 +164,15 @@ async fn the_runtime_drains_after_a_handshake_that_never_completes() -> Result<(
         cert,
     )
     .await;
-    assert!(result.is_err(), "a blackholed handshake must fail, not hang forever");
-    assert_eq!(live_connections(), 0, "a failed handshake opens no connection");
+    assert!(
+        result.is_err(),
+        "a blackholed handshake must fail, not hang forever"
+    );
+    assert_eq!(
+        live_connections(),
+        0,
+        "a failed handshake opens no connection"
+    );
 
     let alive = wait_for_tasks(baseline, Duration::from_secs(5)).await;
     assert!(
@@ -213,7 +212,10 @@ async fn a_refused_udp_port_does_not_leave_the_endpoint_spinning() -> Result<()>
         cert,
     )
     .await;
-    assert!(result.is_err(), "nothing is listening — the handshake must fail");
+    assert!(
+        result.is_err(),
+        "nothing is listening — the handshake must fail"
+    );
 
     let alive = wait_for_tasks(baseline, Duration::from_secs(5)).await;
     assert!(
@@ -241,14 +243,18 @@ async fn dropping_a_client_stops_its_endpoint() -> Result<()> {
     let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
     let endpoint = client.endpoint_handle();
     assert!(
-        endpoint.connect("127.0.0.1:1".parse()?, "localhost").is_ok(),
+        endpoint
+            .connect("127.0.0.1:1".parse()?, "localhost")
+            .is_ok(),
         "endpoint should still be usable while the client is alive"
     );
 
     drop(client);
 
     assert!(
-        endpoint.connect("127.0.0.1:1".parse()?, "localhost").is_err(),
+        endpoint
+            .connect("127.0.0.1:1".parse()?, "localhost")
+            .is_err(),
         "the endpoint must be stopped, not merely unreferenced — its driver is what spun at 100%"
     );
 
