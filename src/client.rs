@@ -46,7 +46,7 @@ pub fn live_connections() -> u32 {
 /// Dropping this closes the connection — see the `Drop` impl. That is not the default
 /// behaviour of the parts it is built from, and the difference cost a day of device logs.
 pub struct QuicClient {
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
     send_request: H3SendRequest,
     authority: String,
     conn: quinn::Connection,
@@ -54,27 +54,31 @@ pub struct QuicClient {
 }
 
 impl Drop for QuicClient {
-    /// Explicit teardown and the gauge decrement.
+    /// Full teardown: connection, h3 driver, endpoint, gauge.
     ///
-    /// HONEST SCOPE — do not cite this as the fix for the 2026-08-09 heat incident. It was
-    /// written on the theory that abandoned connections accumulated (a `JoinHandle` drop detaches
-    /// rather than cancels; an `Endpoint` drop does not close its connections; keep-alive at 15s
-    /// beats the 30s idle timeout, so an orphan could never expire). Mutation testing refuted it:
-    /// with this whole body emptied, `tests/connection_teardown.rs` stays green — including the
-    /// case where a stream is still held. Dropping the client already closes the connection.
+    /// History matters here, because two of these four were added on a theory that turned out to
+    /// be wrong, and the third is the one that actually fixed the heat.
     ///
-    /// What remains true and worth keeping:
-    ///   * `driver.abort()` — a detached task is a real leak even when the connection closes;
-    ///   * `conn.close()` — states the intent at the peer instead of relying on handle-drop
-    ///     order inside two dependencies;
-    ///   * the gauge — the only way to test the accumulation theory on a device rather than
-    ///     against a loopback echo server.
+    /// 2026-08-09, first attempt: written believing abandoned *connections* accumulated. Mutation
+    /// refuted it — emptying this whole body left `tests/connection_teardown.rs` green, held
+    /// stream and all. Dropping the client already closed the connection.
     ///
-    /// The device symptom (`cpu=106% hot=[construct-transport:100%]` for as long as the app is
-    /// foregrounded, against 13% on a fresh single-connection session) is NOT explained yet.
+    /// 2026-08-10, the Time Profiler answered it: `Endpoint::close`. The endpoint driver, not the
+    /// connection, was spinning in `recvmsg`. See `close_endpoint` for the stack and the mechanism.
+    ///
+    /// So each line earns its place differently, and none is decoration:
+    ///   * `conn.close()` — states intent at the peer instead of relying on handle-drop order
+    ///     inside two dependencies. Not load-bearing; kept deliberately.
+    ///   * `driver.abort()` — a detached task is a real leak even when the connection closes.
+    ///   * `close_endpoint()` — **the fix.** Nothing else stops the endpoint driver.
+    ///   * the gauge — what made the device diagnosable at all (`conns=0 tasks=1` is what ruled
+    ///     out both accumulation theories and pointed at a single spinning task).
     fn drop(&mut self) {
         self.conn.close(0u32.into(), b"client dropped");
         self.driver.abort();
+        // Shut the endpoint down, not just the connection. This is the 2026-08-10 heat fix —
+        // see `close_endpoint` for why dropping the handle is not enough.
+        Self::close_endpoint(&self.endpoint);
         LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -148,13 +152,25 @@ impl QuicClient {
             .next()
             .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
 
-        let connecting = endpoint
-            .connect(addr, server_name)
-            .context("start connect")?;
-        let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
-            .await
-            .context("QUIC handshake timed out")?
-            .context("QUIC handshake failed")?;
+        // Every early return from here on must close the endpoint. A failed attempt leaves no
+        // connection behind, so nothing else will ever stop its driver — and a handshake failing
+        // is exactly the situation (blocked UDP) that makes that driver spin. See `close_endpoint`.
+        let attempt = async {
+            let connecting = endpoint
+                .connect(addr, server_name)
+                .context("start connect")?;
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+                .await
+                .context("QUIC handshake timed out")?
+                .context("QUIC handshake failed")
+        };
+        let conn = match attempt.await {
+            Ok(conn) => conn,
+            Err(e) => {
+                Self::close_endpoint(&endpoint);
+                return Err(e);
+            }
+        };
 
         let conn_for_stats = conn.clone();
         let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
@@ -164,12 +180,18 @@ impl QuicClient {
 
         LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            _endpoint: endpoint,
+            endpoint,
             send_request,
             authority: server_name.to_string(),
             conn: conn_for_stats,
             driver: driver_task,
         })
+    }
+
+    /// A clone of the endpoint handle, for asserting after this client is gone that its driver
+    /// was actually stopped. Test/diagnostic use — `Endpoint` is a handle, not the driver.
+    pub fn endpoint_handle(&self) -> Endpoint {
+        self.endpoint.clone()
     }
 
     /// A clone of the quinn connection handle, for observing state (`close_reason`) after this
@@ -186,6 +208,39 @@ impl QuicClient {
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"client closed");
         self.driver.abort();
+        Self::close_endpoint(&self.endpoint);
+    }
+
+    /// Stop quinn's endpoint driver.
+    ///
+    /// THE HEAT FIX (device, Time Profiler, 2026-08-10). One tokio worker at 90% of a 1.5-minute
+    /// trace, all of it here:
+    ///
+    /// ```text
+    ///   quinn::endpoint::EndpointDriver::poll            86.5%
+    ///     RecvState::poll_socket                         86.4%
+    ///       UdpSocket::poll_recv                         86.2%
+    ///         tokio Registration::try_io                 84.1%
+    ///           quinn_udp::UdpSocketState::recv          83.0%   ← 1.37 min of SELF time
+    ///             std::io::error::Error::kind             0.5%
+    ///             recvmsg                                 0.1%
+    /// ```
+    ///
+    /// `recvmsg` returns an error, the error kind is inspected, and the loop runs again
+    /// immediately — for as long as the app is foregrounded. On Darwin a UDP socket surfaces ICMP
+    /// unreachables as a pending socket error, and `Registration::try_io` only clears readiness
+    /// when the closure reports `WouldBlock`; any other error leaves the socket marked ready, so
+    /// the driver is re-polled at once. A blocked UDP path therefore pins a core.
+    ///
+    /// This is also why it never reproduced locally: `tests/runtime_drains.rs` blackholes the
+    /// handshake through TEST-NET-3, which drops packets *silently*. No ICMP, no socket error, no
+    /// spin. The harness could only ever have staged the healthy case.
+    ///
+    /// Dropping the `Endpoint` handle does not stop the driver — quinn keeps it alive while any
+    /// connection exists, and on the failed-handshake path there is no connection to close at
+    /// all. `Endpoint::close` is the thing that ends it.
+    fn close_endpoint(endpoint: &Endpoint) {
+        endpoint.close(0u32.into(), b"endpoint retired");
     }
 
     /// Diagnostic snapshot of the live quinn connection. `ping` is the count of

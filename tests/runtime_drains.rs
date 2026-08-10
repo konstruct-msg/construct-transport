@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use construct_transport::{
-    client::live_connections,
+    client::{live_connections, QuicClient},
     echo_server,
     ffi::{runtime_alive_tasks, QuicChannel},
     tls,
@@ -182,5 +182,76 @@ async fn the_runtime_drains_after_a_handshake_that_never_completes() -> Result<(
          state: conns=0 tasks=1 with a worker thread pinned at 100%."
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_udp_port_does_not_leave_the_endpoint_spinning() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    // The mechanism from the device stack, staged the only way loopback can stage it.
+    //
+    // `the_runtime_drains_after_a_handshake_that_never_completes` uses TEST-NET-3, which drops
+    // packets **silently** — no ICMP, no socket error, so it could never have reproduced the spin
+    // and its passing proved nothing about this. A *closed* local UDP port is different: the
+    // kernel answers with ICMP port-unreachable, which Darwin surfaces as a pending socket error,
+    // which is exactly what `quinn_udp::UdpSocketState::recv` was burning a core on.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let bundle = tls::self_signed(vec!["localhost".to_string()])?;
+    let cert = bundle.cert.as_ref().to_vec();
+
+    // Bind and immediately release a UDP port so nothing is listening on it.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let dead_port = probe.local_addr()?.port();
+    drop(probe);
+
+    let baseline = runtime_alive_tasks();
+
+    let result = QuicChannel::connect(
+        "127.0.0.1".to_string(),
+        dead_port,
+        "localhost".to_string(),
+        cert,
+    )
+    .await;
+    assert!(result.is_err(), "nothing is listening — the handshake must fail");
+
+    let alive = wait_for_tasks(baseline, Duration::from_secs(5)).await;
+    assert!(
+        alive <= baseline,
+        "a refused handshake left {alive} task(s) alive (baseline {baseline}) — the endpoint \
+         driver is still polling a socket that only ever returns an error"
+    );
+
+    // DOES NOT DISCRIMINATE, verified by mutation: stubbing `close_endpoint` out entirely leaves
+    // this green (only `dropping_a_client_stops_its_endpoint` goes red). The refused port produces
+    // the right kind of socket error, but the task still drains here — whatever keeps the driver
+    // alive on device does not happen on loopback. Kept as a guard on the shape, not as evidence
+    // that the spin is fixed. Only the device can settle that: `transport=conns=0 tasks=0`.
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_a_client_stops_its_endpoint() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    // Direct statement of the fix. `Endpoint::close` makes further connects fail with
+    // EndpointStopping; a merely-dropped handle would still accept one, because quinn keeps the
+    // endpoint alive independently of who holds a handle to it.
+    let (port, cert, server) = echo().await?;
+
+    let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
+    let endpoint = client.endpoint_handle();
+    assert!(
+        endpoint.connect("127.0.0.1:1".parse()?, "localhost").is_ok(),
+        "endpoint should still be usable while the client is alive"
+    );
+
+    drop(client);
+
+    assert!(
+        endpoint.connect("127.0.0.1:1".parse()?, "localhost").is_err(),
+        "the endpoint must be stopped, not merely unreferenced — its driver is what spun at 100%"
+    );
+
+    server.task.abort();
     Ok(())
 }
