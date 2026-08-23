@@ -142,3 +142,38 @@ async fn the_live_gauge_returns_to_its_starting_value() -> Result<()> {
     server.task.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn an_explicitly_closed_connection_stops_counting_as_live() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    // The device path. iOS retires a channel with `close()` while its receive pump is still
+    // parked on the stream, so the `Arc` outlives the connection by however long that takes.
+    // Counting until then reports `conns=1` for a connection that is shut, which is
+    // indistinguishable from the abandoned-endpoint leak this gauge was added to find.
+    let before = live_connections();
+    let (port, cert, server) = echo().await?;
+
+    let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
+    let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
+    assert_eq!(stream.recv_response().await?, 200);
+    assert_eq!(live_connections(), before + 1);
+
+    client.close();
+
+    assert_eq!(
+        live_connections(),
+        before,
+        "closed is not live — the held stream must not keep it on the books"
+    );
+
+    drop(stream);
+    drop(client);
+    assert_eq!(
+        live_connections(),
+        before,
+        "and dropping the closed client must not subtract a second time"
+    );
+
+    server.task.abort();
+    Ok(())
+}

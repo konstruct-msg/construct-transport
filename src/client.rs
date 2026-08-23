@@ -9,7 +9,7 @@
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -38,7 +38,14 @@ type H3RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>;
 /// invisible, and on device it was the difference between 13% and 106% CPU.
 static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// How many QUIC connections this process currently holds open.
+/// How many QUIC connections this process currently holds **open**.
+///
+/// Open, not referenced. Until 2026-08-23 only `Drop` decremented this, so a connection retired
+/// through `close()` — which is the path the iOS transport takes on reconnect — kept counting
+/// while a parked stream held the last `Arc`. The device reads that gauge in its RUNTIME line, so
+/// the signature of a *healthy* session was `conns=1` beside a flat `udperr`, which is the exact
+/// signature of the leak it exists to detect. A gauge that cannot distinguish the fixed state
+/// from the broken one is worse than no gauge on the run that has to tell them apart.
 pub fn live_connections() -> u32 {
     LIVE_CONNECTIONS.load(Ordering::Relaxed) as u32
 }
@@ -53,6 +60,9 @@ pub struct QuicClient {
     authority: String,
     conn: quinn::Connection,
     driver: tokio::task::JoinHandle<()>,
+    /// Set by the first retirement, whether that is `close()` or `Drop`. The two are the same
+    /// teardown reached from different directions, and the gauge must fall exactly once.
+    retired: AtomicBool,
 }
 
 impl Drop for QuicClient {
@@ -76,12 +86,7 @@ impl Drop for QuicClient {
     ///   * the gauge — what made the device diagnosable at all (`conns=0 tasks=1` is what ruled
     ///     out both accumulation theories and pointed at a single spinning task).
     fn drop(&mut self) {
-        self.conn.close(0u32.into(), b"client dropped");
-        self.driver.abort();
-        // Shut the endpoint down, not just the connection. This is the 2026-08-10 heat fix —
-        // see `close_endpoint` for why dropping the handle is not enough.
-        Self::close_endpoint(&self.endpoint);
-        LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+        self.retire(b"client dropped");
     }
 }
 
@@ -206,6 +211,7 @@ impl QuicClient {
             authority: server_name.to_string(),
             conn: conn_for_stats,
             driver: driver_task,
+            retired: AtomicBool::new(false),
         })
     }
 
@@ -227,9 +233,24 @@ impl QuicClient {
     /// that abandons a channel while a stream is still parked on `recv_message` would otherwise
     /// keep the whole thing running. Idempotent — quinn ignores a second close.
     pub fn close(&self) {
-        self.conn.close(0u32.into(), b"client closed");
+        self.retire(b"client closed");
+    }
+
+    /// The one teardown, reached from `close()` and from `Drop`.
+    ///
+    /// Each line is explained in the `Drop` doc comment above — only the gauge is new here, and
+    /// only its placement: it must fall on the first retirement, not on the last reference, and
+    /// it must fall once. `swap` is what makes "once" true without a lock; a second retirement is
+    /// otherwise entirely legal and happens on every explicit close (the `Arc` still drops later).
+    fn retire(&self, reason: &[u8]) {
+        self.conn.close(0u32.into(), reason);
         self.driver.abort();
+        // Shut the endpoint down, not just the connection. This is the 2026-08-10 heat fix —
+        // see `close_endpoint` for why dropping the handle is not enough.
         Self::close_endpoint(&self.endpoint);
+        if !self.retired.swap(true, Ordering::Relaxed) {
+            LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Stop quinn's endpoint driver.

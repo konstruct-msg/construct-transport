@@ -1,0 +1,11 @@
+# The crate declares `rust-version = "1.96"`, and rustup's `stable` on this machine is 1.92 —
+# so `cargo build` failed on version resolution while `cargo test` quietly re-ran a binary
+# compiled earlier by a toolchain that was still active. A cached green is the worst of the
+# three outcomes: it reports success for source that was never compiled.
+#
+# Pinned rather than left to `stable` so the toolchain is a property of the repository instead
+# of a property of whoever last ran `rustup default`. Raise it here and in Cargo.toml together.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "aarch64-apple-darwin"]
