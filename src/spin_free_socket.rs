@@ -156,8 +156,9 @@ impl AsyncUdpSocket for SpinFreeUdpSocket {
     }
 
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        self.io
-            .try_io(Interest::WRITABLE, || self.inner.send((&self.io).into(), transmit))
+        self.io.try_io(Interest::WRITABLE, || {
+            self.inner.send((&self.io).into(), transmit)
+        })
     }
 
     fn poll_recv(
@@ -168,9 +169,9 @@ impl AsyncUdpSocket for SpinFreeUdpSocket {
     ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
-            let result = self
-                .io
-                .try_io(Interest::READABLE, || self.inner.recv((&self.io).into(), bufs, meta));
+            let result = self.io.try_io(Interest::READABLE, || {
+                self.inner.recv((&self.io).into(), bufs, meta)
+            });
 
             match RecvDisposition::of(&result) {
                 RecvDisposition::Deliver(n) => return Poll::Ready(Ok(n)),

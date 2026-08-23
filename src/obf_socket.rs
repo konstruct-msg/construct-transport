@@ -18,8 +18,8 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, ServerConfig, UdpPoller};
 use rand::RngCore;
 
-use crate::spin_free_socket::SpinFreeUdpSocket;
 use crate::salamander::{SALT_LEN, Salamander};
+use crate::spin_free_socket::SpinFreeUdpSocket;
 
 fn obfuscated_endpoint(
     bind: SocketAddr,
