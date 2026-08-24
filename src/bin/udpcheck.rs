@@ -414,33 +414,36 @@ async fn main() -> Result<()> {
     } else if let Some(mode) = mode {
         match &ours {
             Probe::Ok { .. } => {
-                println!("VERDICT: with {mode}, OUR gateway SURVIVED where plain QUIC to it dies.");
-                println!(
-                    "         → the block is DEFEATED at this layer. --sni surviving ⇒ targeting"
-                );
-                println!(
-                    "         is by SNI (hide/spoof it). --psk surviving ⇒ hiding that it's QUIC"
-                );
-                println!(
-                    "         works ⇒ Salamander is a viable RU transport; ship it for censored"
-                );
-                println!(
-                    "         nets. (Compare with a plain run to the SAME port to rule out port.)"
-                );
+                // This process cannot see whether a VPN is up, and a surviving run means two
+                // completely different things depending on that. On 2026-08-24 the same --psk
+                // command produced this branch twice: once on the censored path (it did not —
+                // it died at 30.6s) and once tunnelled, where it survived and this text would
+                // have read "ship it" about a run that never touched the censor. The preconditions
+                // are the whole verdict, so they are printed before the conclusion, not after.
+                println!("VERDICT: with {mode}, our gateway survived {hold:?}.");
+                println!("         THIS MEANS NOTHING UNLESS BOTH ARE TRUE — check them now:");
+                println!("           1. this run went over the CENSORED path (no VPN, no tunnel);");
+                println!("           2. a PLAIN run to the SAME host and port, on that same path,");
+                println!("              DIED. Without it, {mode} was never the variable.");
+                println!("         Both true ⇒ the block is defeated at this layer: --sni ⇒ keyed");
+                println!("         on SNI, --psk ⇒ hiding that it is QUIC works, and that makes");
+                println!("         Salamander a candidate RU transport worth deciding on.");
+                println!("         Either false ⇒ this run only shows the gateway serves {mode}.");
             }
             Probe::Throttled { died_after, .. } => {
                 println!(
                     "VERDICT: {mode} did NOT help — our gateway still died after {died_after:?}."
                 );
-                println!(
-                    "         → the block is DEEPER than this layer. --sni failing ⇒ NOT SNI-keyed"
-                );
-                println!(
-                    "         (destination-IP or QUIC-fingerprint). --psk failing ⇒ even hiding"
-                );
-                println!(
-                    "         QUIC fails ⇒ IP-level block ⇒ need fronting/relays (veil-front)."
-                );
+                println!("         → the block is DEEPER than this layer. --sni failing ⇒ NOT");
+                println!("         SNI-keyed. --psk failing ⇒ even hiding that it is QUIC fails,");
+                println!("         so the key is the destination and no payload-layer trick");
+                println!("         reaches it ⇒ fronting / address diversity (veil-front).");
+                println!("         BEFORE BELIEVING A --psk FAILURE: run the same command over a");
+                println!("         VPN. serve_obfuscated is otherwise-dormant code, and a gateway");
+                println!("         that drops obfuscated connections on its own looks exactly");
+                println!("         like this. Survives tunnelled ⇒ the gateway is fine and this");
+                println!("         verdict holds. Dies tunnelled ⇒ our own path is broken and");
+                println!("         this run says nothing about any censor. (2026-08-24: it held.)");
             }
             Probe::Fail(e) => {
                 println!("VERDICT: with {mode}, the handshake to our gateway FAILED: {e}");
