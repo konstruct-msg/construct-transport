@@ -24,19 +24,35 @@ use crate::salamander::Salamander;
 use crate::spin_free_socket::SpinFreeUdpSocket;
 use crate::tls::{self, CertBundle};
 
-/// QUIC connect handshake timeout. Kept short so a network that silently drops the
-/// obfuscated UDP handshake (DPI block) fails over to H2/VEIL fast instead of stalling the
-/// user. A working handshake is ~1 RTT; 3s leaves margin for high-latency-but-working links.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Name resolution budget, separate from the handshake and reported separately.
+/// Everything `connect` may spend before the caller has already stopped waiting.
 ///
-/// Two seconds because a resolver that has not answered in two is not going to make the
-/// difference: iOS abandons fast-UDP at 1.5s (`streamOpenAcceptTimeoutH3`) regardless, so anything
-/// longer is spent producing an error nobody is waiting for any more. It exists to make the
-/// failure *attributable*, not to save time — "DNS timed out" and "handshake timed out" are
-/// different problems and used to arrive under the same name.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// This is not our number. iOS abandons fast-UDP at `NetworkTiming.GRPC.streamOpenAcceptTimeoutH3`
+/// (1.5s) and marks QUIC failed for the whole session; nothing here can change that verdict, it
+/// can only arrive after it. Which is what used to happen — the handshake budget was 3s, so on the
+/// 2026-08-24 device run the session was downgraded to H2 at 09:41:28 and this crate's
+/// "handshake timed out" was logged at 09:41:29, a second *after* the decision it was supposed to
+/// explain, having kept a doomed endpoint polling for that second.
+///
+/// Two deadlines for one question, and the one that decided was in the other repo. Lowering this
+/// costs no connection that could have been kept: every observed failure burned the full 3s, and
+/// a handshake slower than 1.5s was never going to be used.
+const CONNECT_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Name resolution budget — inside `CONNECT_BUDGET`, and reported under its own name.
+///
+/// It exists to make the failure *attributable*: "DNS timed out" and "handshake timed out" are
+/// different problems and used to arrive under the same name. That only works if it can actually
+/// fire before the caller gives up, which is why it is a third of the budget and not, as it was
+/// until now, longer than the whole of it.
+const RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// QUIC handshake budget: what is left of `CONNECT_BUDGET` after resolution — derived, not
+/// written down again, so the two phases cannot sum past the budget by editing one of them.
+///
+/// A working handshake is ~1 RTT — 85ms to the Amsterdam gateway on the run that proved the
+/// address-family fix — so a second is twelve of them. Short is the point: a network that silently
+/// drops the UDP handshake must fail over to H2/VEIL, not stall the user.
+const HANDSHAKE_TIMEOUT: Duration = CONNECT_BUDGET.saturating_sub(RESOLVE_TIMEOUT);
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
@@ -554,5 +570,26 @@ mod bind_family_tests {
         let v4 = QuicClient::bind_addr_for("1.2.3.4:443".parse().unwrap());
         let v6 = QuicClient::bind_addr_for("[2001:db8::1]:443".parse().unwrap());
         assert_ne!(v4, v6);
+    }
+
+    /// Resolution must not eat the budget it shares.
+    ///
+    /// `HANDSHAKE_TIMEOUT` is now derived, so the sum can no longer exceed `CONNECT_BUDGET` —
+    /// but raising `RESOLVE_TIMEOUT` silently shrinks the handshake instead, and at 1.5s it
+    /// saturates the handshake to zero and every connect fails instantly. That is the failure
+    /// this guards: the old values (resolve 2s, handshake 3s, caller 1.5s) were each defensible
+    /// on their own and only wrong together.
+    #[test]
+    fn resolution_leaves_the_handshake_a_usable_window() {
+        assert!(
+            HANDSHAKE_TIMEOUT >= Duration::from_millis(500),
+            "resolve {RESOLVE_TIMEOUT:?} leaves only {HANDSHAKE_TIMEOUT:?} of {CONNECT_BUDGET:?} \
+             for the handshake — the measured one is ~85ms, so this is under six of them"
+        );
+        assert!(
+            RESOLVE_TIMEOUT < HANDSHAKE_TIMEOUT,
+            "resolution is one round trip and the handshake is at least one — a resolve budget \
+             at or above the handshake's spends the window on the cheaper phase"
+        );
     }
 }

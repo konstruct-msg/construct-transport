@@ -78,8 +78,9 @@ pub const QUIC_MAX_IDLE_SECS: u64 = 30;
 /// where every keep-alive packet is double-encrypted and keeps the radio warm. A PING
 /// every 15s with a 30s idle ceiling cuts radio wake-ups ~5× while still keeping a
 /// *healthy* idle connection alive with margin against mobile jitter. Fast *connect*
-/// failover is unchanged: `HANDSHAKE_TIMEOUT` (3s, client.rs) still bails out of a
-/// dead handshake quickly; only mid-stream death detection relaxes to ≤30s. Applied to
+/// failover is unchanged: `CONNECT_BUDGET` (1.5s, client.rs — it said 3s here until
+/// 2026-08-24, when the caller turned out to decide at 1.5s and always had) still bails out
+/// of a dead handshake quickly; only mid-stream death detection relaxes to ≤30s. Applied to
 /// BOTH ends; the negotiated idle timeout is the min of the two.
 /// Build a transport config with explicit keep-alive / idle timeouts (exposed so tests
 /// can exercise the keep-alive behaviour with short timeouts).
