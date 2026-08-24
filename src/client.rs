@@ -7,7 +7,7 @@
 //! both ways; h3 0.0.8 also supports client-side `split()` for true full-duplex
 //! (used later by the FFI pump — not needed for the sequential API here).
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -28,6 +28,15 @@ use crate::tls::{self, CertBundle};
 /// obfuscated UDP handshake (DPI block) fails over to H2/VEIL fast instead of stalling the
 /// user. A working handshake is ~1 RTT; 3s leaves margin for high-latency-but-working links.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Name resolution budget, separate from the handshake and reported separately.
+///
+/// Two seconds because a resolver that has not answered in two is not going to make the
+/// difference: iOS abandons fast-UDP at 1.5s (`streamOpenAcceptTimeoutH3`) regardless, so anything
+/// longer is spent producing an error nobody is waiting for any more. It exists to make the
+/// failure *attributable*, not to save time — "DNS timed out" and "handshake timed out" are
+/// different problems and used to arrive under the same name.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
@@ -172,11 +181,25 @@ impl QuicClient {
         port: u16,
         server_name: &str,
     ) -> Result<Self> {
-        let addr: SocketAddr = (host, port)
-            .to_socket_addrs()
-            .with_context(|| format!("resolve {host}:{port}"))?
-            .next()
-            .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
+        // Resolution is async and bounded. It used to be `(host, port).to_socket_addrs()`, which
+        // is two defects in one line: a blocking getaddrinfo on a tokio worker thread, and — the
+        // one that cost a device run — **outside** `HANDSHAKE_TIMEOUT`, so the 3s bound covered
+        // only the part that was already fast.
+        //
+        // Device log 2026-08-24: channel created 07:35:25, "QUIC handshake timed out" reported at
+        // 07:35:35. Ten seconds against a three-second timeout. The missing seven were a stalled
+        // lookup of `quic.konstruct.cc`, reported under the handshake's name because that is the
+        // only error the caller could reach — so a DNS problem read as a blocked UDP path, which
+        // is a different diagnosis with a different fix.
+        let addr: SocketAddr = tokio::time::timeout(
+            RESOLVE_TIMEOUT,
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .with_context(|| format!("DNS timed out for {host}:{port}"))?
+        .with_context(|| format!("resolve {host}:{port}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
 
         // Every early return from here on must close the endpoint. A failed attempt leaves no
         // connection behind, so nothing else will ever stop its driver — and a handshake failing
