@@ -444,29 +444,47 @@ async fn main() -> Result<()> {
             }
             Probe::Fail(e) => {
                 println!("VERDICT: with {mode}, the handshake to our gateway FAILED: {e}");
-                println!("         Check the gateway serves this mode on {ours_host}:{ours_port}");
-                println!("         (--psk needs the matching QUIC_OBF_PSK listener; --sni needs a");
-                println!(
-                    "         plain listener). Control was {}.",
-                    if control_ok { "OK" } else { "also down" }
-                );
+                println!("         Control was {}.", if control_ok { "OK" } else { "also down" });
+                if let Some(s) = &sni {
+                    // The substitute name is not a neutral instrument. A name that is itself
+                    // QUIC-blocked on this network (www.google.com on RU networks, for one)
+                    // produces this exact FAIL with nothing to do with our endpoint, and reads
+                    // like an SNI-keyed block on us. Validate the name before believing the test.
+                    println!("         BUT this run proves nothing until \"{s}\" is cleared as a");
+                    println!("         substitute: a name that is itself blocked over QUIC here");
+                    println!("         fails the same way. Check it against its own host first:");
+                    println!("           cargo run --bin udpcheck -- {s} 443 --hold 45");
+                    println!("         If that also fails, pick a different name and re-run.");
+                    println!("         (Our gateway does not select on SNI — one cert for every");
+                    println!("         name, tls::server_config — so it is not the one refusing.)");
+                } else {
+                    println!("         Check the gateway serves this mode on {ours_host}:{ours_port}");
+                    println!("         (--psk needs the matching QUIC_OBF_PSK listener).");
+                }
             }
         }
     } else {
         match (control_ok, ours_ok) {
             (true, true) if ours_throttled && !control_throttled => {
+                // Two candidates, and this run cannot separate them: the control is a different
+                // *server*, so its survival rules out a generic UDP block and nothing else.
+                // "Something on the path kills our flow" and "our gateway stops answering" both
+                // look exactly like this from here. Saying only the first is how a diagnostic
+                // tool hands over a conclusion its data does not carry.
                 println!(
-                    "VERDICT: the public control SURVIVED but OUR gateway was KILLED mid-connection."
+                    "VERDICT: the public control SURVIVED but OUR gateway went SILENT mid-connection."
                 );
-                println!(
-                    "         QUIC/UDP works on this network — the throttle is TARGETED at our"
-                );
-                println!(
-                    "         endpoint (by SNI or destination IP), not a generic UDP block. Re-run"
-                );
-                println!(
-                    "         with --sni <benign> and/or --psk <key> to find which. App uses H2 meanwhile."
-                );
+                println!("         QUIC/UDP works on this network, so this is not a generic UDP");
+                println!("         block. Two candidates remain and this run does not separate");
+                println!("         them — the control is a different server, not a second path:");
+                println!("           1. the path drops our flow (targeted by SNI or by our IP);");
+                println!("           2. our gateway stops answering a few seconds in.");
+                println!("         SEPARATE THEM by running this same command from OUTSIDE this");
+                println!("         network — the gateway host itself, or any other machine:");
+                println!("           cargo run --bin udpcheck -- {ours_host} {ours_port} --hold 45");
+                println!("         Survives there ⇒ (1), this network. Dies there too ⇒ (2), ours.");
+                println!("         Only once it is (1): --sni <benign> / --psk <key> to find which.");
+                println!("         The app uses H2 meanwhile.");
             }
             (true, true) if control_throttled => {
                 println!(
