@@ -112,13 +112,41 @@ impl QuicClient {
     ) -> Result<Self> {
         let client_config = tls::client_config(&Self::trust_bundle(trust_cert))?;
 
-        // Prefer dual-stack IPv6 (NAT64 / IPv6-only LANs), fall back to IPv4.
-        let mut endpoint = Self::bind_endpoint("[::]:0".parse().unwrap())
-            .or_else(|_| Self::bind_endpoint("0.0.0.0:0".parse().unwrap()))
-            .context("bind client endpoint")?;
+        let addr = Self::resolve(host, port).await?;
+        let mut endpoint =
+            Self::bind_endpoint(Self::bind_addr_for(addr)).context("bind client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
-        Self::handshake(endpoint, host, port, server_name).await
+        Self::handshake(endpoint, addr, server_name).await
+    }
+
+    /// The local address to bind so this destination is reachable from the socket.
+    ///
+    /// **The bug this replaces.** The endpoint used to bind `[::]:0` and fall back to `0.0.0.0:0`
+    /// only if that failed — "prefer dual-stack IPv6 (NAT64 / IPv6-only LANs)". Binding `[::]`
+    /// succeeds almost everywhere, so almost everywhere the socket was `AF_INET6`. Sending to a
+    /// plain `AF_INET` destination from an `AF_INET6` socket does not work: the address has to be
+    /// v4-mapped (`::ffff:a.b.c.d`), and quinn passes `Transmit.destination` through unchanged.
+    /// `quic.konstruct.cc` has an A record and no AAAA, so every datagram failed to leave, the
+    /// handshake expired at its 3s timeout, and it read as "UDP is blocked on this path".
+    ///
+    /// Nothing contradicted that reading, because `udperr` counts **receive** errors only
+    /// (`spin_free_socket::poll_recv`) — sends that never leave are invisible to it. And it did
+    /// work occasionally: on a NAT64 carrier network DNS64 synthesises an AAAA, resolution returns
+    /// an IPv6 address, and the IPv6 socket sends it happily. One success in five, which read as a
+    /// flaky network rather than as the address family it actually was.
+    ///
+    /// Verified 2026-08-24: `cargo run --bin probe` binds `0.0.0.0:0` and completes the same
+    /// handshake to the same gateway in 56ms, from the same building.
+    ///
+    /// Matching the family to the resolved address is picked over v4-mapping the destination
+    /// because it stays correct in both directions — a v4-mapped destination is wrong the moment
+    /// the socket is IPv4, which is exactly what the old fallback produced.
+    fn bind_addr_for(peer: SocketAddr) -> SocketAddr {
+        match peer {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("literal"),
+            SocketAddr::V6(_) => "[::]:0".parse().expect("literal"),
+        }
     }
 
     /// Like [`connect`](Self::connect) but every datagram is Salamander-obfuscated with `psk`
@@ -134,17 +162,14 @@ impl QuicClient {
     ) -> Result<Self> {
         let client_config = tls::client_config_obf(&Self::trust_bundle(trust_cert))?;
 
-        // Dual-stack as above, but over a Salamander-obfuscated UDP socket.
+        // Same family rule as the plain path — see `bind_addr_for`.
         let obf = Salamander::new(psk);
-        let mut endpoint =
-            obf_socket::obfuscated_client_endpoint("[::]:0".parse().unwrap(), obf.clone())
-                .or_else(|_| {
-                    obf_socket::obfuscated_client_endpoint("0.0.0.0:0".parse().unwrap(), obf)
-                })
-                .context("bind obfuscated client endpoint")?;
+        let addr = Self::resolve(host, port).await?;
+        let mut endpoint = obf_socket::obfuscated_client_endpoint(Self::bind_addr_for(addr), obf)
+            .context("bind obfuscated client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
-        Self::handshake(endpoint, host, port, server_name).await
+        Self::handshake(endpoint, addr, server_name).await
     }
 
     /// Bind a client endpoint on our own socket rather than `Endpoint::client`.
@@ -173,33 +198,27 @@ impl QuicClient {
         }
     }
 
-    /// Resolve `host:port`, run the QUIC handshake on `endpoint`, and start the h3 driver.
+    /// Name resolution: async, bounded, and reported under its own name.
+    ///
+    /// It used to be a blocking `to_socket_addrs()` inside `handshake` and *outside*
+    /// `HANDSHAKE_TIMEOUT` — a getaddrinfo blocking a tokio worker with no deadline of its own,
+    /// whose failures surfaced as "QUIC handshake timed out" because that was the only error the
+    /// caller could reach.
+    ///
+    /// It now also runs **before** the socket is bound, because the resolved address decides the
+    /// socket family. See `bind_addr_for`.
+    async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+        tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .with_context(|| format!("DNS timed out for {host}:{port}"))?
+            .with_context(|| format!("resolve {host}:{port}"))?
+            .next()
+            .ok_or_else(|| anyhow!("no address for {host}:{port}"))
+    }
+
+    /// Run the QUIC handshake on an already-bound `endpoint` and start the h3 driver.
     /// Shared by the plain and obfuscated connect paths — only the endpoint differs.
-    async fn handshake(
-        endpoint: Endpoint,
-        host: &str,
-        port: u16,
-        server_name: &str,
-    ) -> Result<Self> {
-        // Resolution is async and bounded. It used to be `(host, port).to_socket_addrs()`, which
-        // is two defects in one line: a blocking getaddrinfo on a tokio worker thread, and — the
-        // one that cost a device run — **outside** `HANDSHAKE_TIMEOUT`, so the 3s bound covered
-        // only the part that was already fast.
-        //
-        // Device log 2026-08-24: channel created 07:35:25, "QUIC handshake timed out" reported at
-        // 07:35:35. Ten seconds against a three-second timeout. The missing seven were a stalled
-        // lookup of `quic.konstruct.cc`, reported under the handshake's name because that is the
-        // only error the caller could reach — so a DNS problem read as a blocked UDP path, which
-        // is a different diagnosis with a different fix.
-        let addr: SocketAddr = tokio::time::timeout(
-            RESOLVE_TIMEOUT,
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        .with_context(|| format!("DNS timed out for {host}:{port}"))?
-        .with_context(|| format!("resolve {host}:{port}"))?
-        .next()
-        .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
+    async fn handshake(endpoint: Endpoint, addr: SocketAddr, server_name: &str) -> Result<Self> {
 
         // Every early return from here on must close the endpoint. A failed attempt leaves no
         // connection behind, so nothing else will ever stop its driver — and a handshake failing
@@ -491,5 +510,49 @@ impl QuicRecvStream {
                     .collect()
             })
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod bind_family_tests {
+    use super::*;
+
+    /// The socket family must follow the destination.
+    ///
+    /// Binding `[::]` and sending to a plain `AF_INET` peer does not work — the address has to be
+    /// v4-mapped, and quinn forwards `Transmit.destination` unchanged. The old code preferred
+    /// `[::]:0` and fell back to IPv4 only if the *bind* failed, which it essentially never does,
+    /// so on any network resolving `quic.konstruct.cc` (A record, no AAAA) to IPv4 nothing left
+    /// the socket. It read as blocked UDP for three device runs: `udperr` counts receive errors
+    /// only, so sends that never happen leave no trace.
+    ///
+    /// Mutation: always return `[::]:0` — restores the bug.
+    #[test]
+    fn an_ipv4_peer_gets_an_ipv4_socket() {
+        let peer: SocketAddr = "152.42.130.140:443".parse().unwrap();
+        let bind = QuicClient::bind_addr_for(peer);
+        assert!(bind.is_ipv4(), "IPv4 peer must be reached from an IPv4 socket, got {bind}");
+        assert_eq!(bind.port(), 0, "the port must stay ephemeral");
+    }
+
+    /// The NAT64 case, and the reason the old code preferred IPv6 in the first place: on a
+    /// carrier network DNS64 synthesises an AAAA and resolution returns IPv6. That path worked
+    /// before and must keep working — it is why the failure looked intermittent.
+    ///
+    /// Mutation: always return `0.0.0.0:0` — breaks IPv6-only networks instead.
+    #[test]
+    fn an_ipv6_peer_gets_an_ipv6_socket() {
+        let peer: SocketAddr = "[64:ff9b::9852:828c]:443".parse().unwrap();
+        let bind = QuicClient::bind_addr_for(peer);
+        assert!(bind.is_ipv6(), "IPv6 peer must be reached from an IPv6 socket, got {bind}");
+        assert_eq!(bind.port(), 0);
+    }
+
+    /// Neither family may be hardcoded: the two answers must differ.
+    #[test]
+    fn the_two_families_do_not_collapse() {
+        let v4 = QuicClient::bind_addr_for("1.2.3.4:443".parse().unwrap());
+        let v6 = QuicClient::bind_addr_for("[2001:db8::1]:443".parse().unwrap());
+        assert_ne!(v4, v6);
     }
 }
