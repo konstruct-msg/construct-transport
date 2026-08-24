@@ -162,6 +162,23 @@ impl QuicChannel {
         self.inner.close();
     }
 
+    /// Carry this connection across a network handover, and return the new local address once the
+    /// gateway has answered on it.
+    ///
+    /// Call it when the OS reports the path changed. QUIC identifies a connection by connection ID,
+    /// so the handover need not cost anything — but quinn cannot see the handover, and without this
+    /// it keeps sending from a source address that no longer routes until the 30s idle timeout
+    /// kills a connection that was never unreachable.
+    ///
+    /// **An error here is normal and means "reconnect".** It says the migration was not confirmed
+    /// within one connect budget, which is precisely when opening a fresh connection is the better
+    /// move. The caller must not treat it as a transport fault: the point of returning a verdict
+    /// rather than swapping the socket silently is that the caller keeps its fallback.
+    pub async fn rebind(&self) -> Result<String, TransportError> {
+        let client = self.inner.clone();
+        on_rt(async move { client.rebind().await.map(|a| a.to_string()).map_err(err) }).await
+    }
+
     /// Diagnostic: live quinn connection stats (tx/rx datagrams, PING frames sent, RTT,
     /// close reason). Runs on `RT`, so it also proves the dedicated runtime is responsive.
     /// `ping_tx` not growing over time ⇒ keep-alive isn't firing.

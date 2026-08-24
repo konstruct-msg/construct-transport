@@ -21,6 +21,41 @@ use rand::RngCore;
 use crate::salamander::{SALT_LEN, Salamander};
 use crate::spin_free_socket::SpinFreeUdpSocket;
 
+/// Build the UDP socket an endpoint runs on: spin-free always, obfuscated when a PSK is in play.
+///
+/// One builder for the first socket and for every replacement `Endpoint::rebind_abstract` is
+/// handed. Those are two carriers of one fact — how this connection's datagrams look on the wire —
+/// and the disagreement has no error path: a plain socket rebound under an obfuscated connection
+/// sends every datagram in the clear to a gateway that discards them as garbage, so the symptom is
+/// a connection that simply stops, on the one code path (a network handover) where stopping is
+/// already the expected background noise.
+pub fn client_socket(bind: SocketAddr, obf: Option<&Salamander>) -> io::Result<ClientSocket> {
+    // NOT `runtime.wrap_udp_socket`: quinn's own socket spins a core when recvmsg reports an
+    // error other than WouldBlock (see spin_free_socket). The obfuscated wrapper delegates
+    // poll_recv straight to the inner socket, so it inherits whichever bug the inner socket has —
+    // and, for the same reason, its per-socket receive counter.
+    let base = Arc::new(SpinFreeUdpSocket::bind(bind)?);
+    let endpoint_socket: Arc<dyn AsyncUdpSocket> = match obf {
+        Some(obf) => Arc::new(ObfuscatedUdpSocket::new(base.clone(), obf.clone())),
+        None => base.clone(),
+    };
+    Ok(ClientSocket {
+        endpoint_socket,
+        base,
+    })
+}
+
+/// A freshly built client socket, and a handle to the thing underneath it that counts.
+///
+/// Two views of one socket rather than two sockets: `endpoint_socket` is what quinn runs on and
+/// may be the obfuscating wrapper, `base` is the same socket seen from below, and it is the only
+/// place that can answer "did anything arrive **here**" — which is what `QuicClient::rebind` needs
+/// and what the connection-level counters cannot tell it.
+pub struct ClientSocket {
+    pub endpoint_socket: Arc<dyn AsyncUdpSocket>,
+    pub base: Arc<SpinFreeUdpSocket>,
+}
+
 fn obfuscated_endpoint(
     bind: SocketAddr,
     obf: Salamander,
@@ -28,12 +63,7 @@ fn obfuscated_endpoint(
 ) -> io::Result<Endpoint> {
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime for QUIC endpoint"))?;
-    let std_socket = std::net::UdpSocket::bind(bind)?;
-    // NOT `runtime.wrap_udp_socket`: quinn's own socket spins a core when recvmsg reports an
-    // error other than WouldBlock (see spin_free_socket). This path delegates poll_recv straight
-    // to the inner socket, so it inherits whichever bug the inner socket has.
-    let inner: Arc<dyn AsyncUdpSocket> = Arc::new(SpinFreeUdpSocket::wrap(std_socket)?);
-    let socket = Arc::new(ObfuscatedUdpSocket::new(inner, obf));
+    let socket = client_socket(bind, Some(&obf))?.endpoint_socket;
     Endpoint::new_with_abstract_socket(EndpointConfig::default(), server_config, socket, runtime)
 }
 

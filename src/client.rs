@@ -8,7 +8,6 @@
 //! (used later by the FFI pump — not needed for the sequential API here).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -21,7 +20,6 @@ use rustls::pki_types::CertificateDer;
 use crate::grpc;
 use crate::obf_socket;
 use crate::salamander::Salamander;
-use crate::spin_free_socket::SpinFreeUdpSocket;
 use crate::tls::{self, CertBundle};
 
 /// Everything `connect` may spend before the caller has already stopped waiting.
@@ -54,6 +52,20 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 /// drops the UDP handshake must fail over to H2/VEIL, not stall the user.
 const HANDSHAKE_TIMEOUT: Duration = CONNECT_BUDGET.saturating_sub(RESOLVE_TIMEOUT);
 
+/// How long `rebind` waits for the peer to answer on the new socket before giving the connection
+/// up as unmigratable.
+///
+/// Deliberately the same value as a whole connect, and derived from it rather than written down
+/// again: the alternative to waiting here is opening a fresh connection, so once proving the old
+/// one survives costs more than replacing it, waiting is the wrong choice. Migration is one round
+/// trip when it works — 85ms to the Amsterdam gateway — so this is generous by an order of
+/// magnitude and only bounds the pathological case.
+const MIGRATION_PROOF_BUDGET: Duration = CONNECT_BUDGET;
+
+/// Poll step while waiting for that answer. quinn exposes no future for "migration complete", so
+/// the arrival has to be observed on the connection's stats.
+const MIGRATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
 type H3SendHalf = h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>;
@@ -75,12 +87,24 @@ pub fn live_connections() -> u32 {
     LIVE_CONNECTIONS.load(Ordering::Relaxed) as u32
 }
 
+/// Everything needed to build a socket indistinguishable from the one this endpoint started on.
+///
+/// Kept because `rebind` must produce exactly that and has no way to ask the endpoint what it had:
+/// the address family (which `bind_addr_for` derived from the peer) and the obfuscation, if any.
+#[derive(Clone)]
+struct SocketRecipe {
+    bind: SocketAddr,
+    obf: Option<Salamander>,
+}
+
 /// One QUIC/HTTP-3 connection to a gateway. Cheap to open streams from.
 ///
 /// Dropping this closes the connection — see the `Drop` impl. That is not the default
 /// behaviour of the parts it is built from, and the difference cost a day of device logs.
 pub struct QuicClient {
     endpoint: Endpoint,
+    /// How to rebuild this endpoint's socket on a network handover. See `rebind`.
+    socket_recipe: SocketRecipe,
     send_request: H3SendRequest,
     authority: String,
     conn: quinn::Connection,
@@ -129,11 +153,14 @@ impl QuicClient {
         let client_config = tls::client_config(&Self::trust_bundle(trust_cert))?;
 
         let addr = Self::resolve(host, port).await?;
-        let mut endpoint =
-            Self::bind_endpoint(Self::bind_addr_for(addr)).context("bind client endpoint")?;
+        let recipe = SocketRecipe {
+            bind: Self::bind_addr_for(addr),
+            obf: None,
+        };
+        let mut endpoint = Self::bind_endpoint(recipe.bind).context("bind client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
-        Self::handshake(endpoint, addr, server_name).await
+        Self::handshake(endpoint, recipe, addr, server_name).await
     }
 
     /// The local address to bind so this destination is reachable from the socket.
@@ -183,11 +210,15 @@ impl QuicClient {
         // Same family rule as the plain path — see `bind_addr_for`.
         let obf = Salamander::new(psk);
         let addr = Self::resolve(host, port).await?;
-        let mut endpoint = obf_socket::obfuscated_client_endpoint(Self::bind_addr_for(addr), obf)
+        let recipe = SocketRecipe {
+            bind: Self::bind_addr_for(addr),
+            obf: Some(obf.clone()),
+        };
+        let mut endpoint = obf_socket::obfuscated_client_endpoint(recipe.bind, obf)
             .context("bind obfuscated client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
-        Self::handshake(endpoint, addr, server_name).await
+        Self::handshake(endpoint, recipe, addr, server_name).await
     }
 
     /// Bind a client endpoint on our own socket rather than `Endpoint::client`.
@@ -200,7 +231,7 @@ impl QuicClient {
     fn bind_endpoint(addr: std::net::SocketAddr) -> Result<Endpoint> {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC endpoint"))?;
-        let socket = Arc::new(SpinFreeUdpSocket::bind(addr)?);
+        let socket = obf_socket::client_socket(addr, None)?.endpoint_socket;
         Ok(Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             None,
@@ -236,7 +267,12 @@ impl QuicClient {
 
     /// Run the QUIC handshake on an already-bound `endpoint` and start the h3 driver.
     /// Shared by the plain and obfuscated connect paths — only the endpoint differs.
-    async fn handshake(endpoint: Endpoint, addr: SocketAddr, server_name: &str) -> Result<Self> {
+    async fn handshake(
+        endpoint: Endpoint,
+        socket_recipe: SocketRecipe,
+        addr: SocketAddr,
+        server_name: &str,
+    ) -> Result<Self> {
         // Every early return from here on must close the endpoint. A failed attempt leaves no
         // connection behind, so nothing else will ever stop its driver — and a handshake failing
         // is exactly the situation (blocked UDP) that makes that driver spin. See `close_endpoint`.
@@ -266,12 +302,79 @@ impl QuicClient {
         LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             endpoint,
+            socket_recipe,
             send_request,
             authority: server_name.to_string(),
             conn: conn_for_stats,
             driver: driver_task,
             retired: AtomicBool::new(false),
         })
+    }
+
+    /// Move this connection onto a freshly bound socket, and return only once the peer has been
+    /// heard from on it.
+    ///
+    /// **What this is for.** A QUIC connection is addressed by connection ID, not by four-tuple,
+    /// so a wifi↔cellular handover need not cost it anything — that mobility is one of the two
+    /// reasons this transport exists. But quinn does not notice a handover on its own: the old
+    /// socket keeps its old source address, the datagrams it sends are no longer routable, and the
+    /// connection dies at the 30s idle timeout while looking alive the whole way down. The device
+    /// log of 2026-08-24 is exactly that: `rx_pkts` frozen at 16 while `tx_pkts` climbed to 47.
+    ///
+    /// **Why it returns a verdict rather than just swapping the socket.** The caller's fallback is
+    /// to throw the connection away and open a new one, which always works. If this reported
+    /// success on the swap alone, a migration the network or the gateway declined would replace an
+    /// immediate reconnect with a silent 30s hole — worse than the behaviour it replaces, on the
+    /// same path, and invisible. So the swap is the easy half and the proof is the point.
+    ///
+    /// **What counts as proof.** `Endpoint::rebind_abstract` hands every connection a
+    /// `Rebind` event, and quinn answers it with `local_address_changed()` — which rotates to an
+    /// unused remote connection ID and sends a PING immediately (`quinn-proto`,
+    /// `connection/mod.rs:3073`). So an answer means the peer both accepted the migration and can
+    /// reach the new address: one round trip, no new machinery. The CID rotation matters beyond
+    /// correctness — reusing the old CID from a new address is what would let an observer link the
+    /// two paths to one user.
+    ///
+    /// The proof is that a datagram arrived **on the new socket**, not that the connection's
+    /// receive counter moved. Those are not the same claim and the difference is not theoretical:
+    /// `rebind_abstract` keeps the previous socket alive (`prev_socket`), so a packet already in
+    /// flight to the old address lands, bumps the connection's `udp_rx`, and reads as a successful
+    /// migration. Written that way first, it declared success for a socket that could not talk to
+    /// the gateway at all. Both are required now — something arrived here, and the connection
+    /// accepted at least one datagram since the swap.
+    ///
+    /// Polled rather than awaited because quinn exposes no "migration complete" future; the
+    /// interval is short and the budget is one connect.
+    pub async fn rebind(&self) -> Result<SocketAddr> {
+        let accepted_before = self.conn.stats().udp_rx.datagrams;
+
+        let socket =
+            obf_socket::client_socket(self.socket_recipe.bind, self.socket_recipe.obf.as_ref())
+                .context("bind replacement socket")?;
+        let arrivals = socket.base.clone();
+        self.endpoint
+            .rebind_abstract(socket.endpoint_socket)
+            .context("rebind endpoint")?;
+        let local = self.endpoint.local_addr().context("local addr after rebind")?;
+
+        let deadline = tokio::time::Instant::now() + MIGRATION_PROOF_BUDGET;
+        loop {
+            if let Some(reason) = self.conn.close_reason() {
+                return Err(anyhow!("connection died during migration: {reason}"));
+            }
+            if arrivals.received_datagrams() > 0
+                && self.conn.stats().udp_rx.datagrams > accepted_before
+            {
+                return Ok(local);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "migration unconfirmed after {}ms — peer did not answer on {local}",
+                    MIGRATION_PROOF_BUDGET.as_millis()
+                ));
+            }
+            tokio::time::sleep(MIGRATION_POLL_INTERVAL).await;
+        }
     }
 
     /// A clone of the endpoint handle, for asserting after this client is gone that its driver

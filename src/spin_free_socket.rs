@@ -164,6 +164,15 @@ impl SendDisposition {
 pub struct SpinFreeUdpSocket {
     io: tokio::net::UdpSocket,
     inner: udp::UdpSocketState,
+    /// Datagrams delivered **on this socket**, as opposed to on the connection.
+    ///
+    /// Per-instance on purpose. `QuicClient::rebind` has to answer "did the peer reply to us at
+    /// the new address", and the connection-level counter cannot: quinn keeps the previous socket
+    /// alive for a while after a rebind (`Endpoint::rebind_abstract` stores it in `prev_socket`),
+    /// so a packet already in flight to the old address arrives, increments the connection's
+    /// `udp_rx`, and looks exactly like a successful migration. That false positive was observed
+    /// while building the migration test, not reasoned about afterwards.
+    received: AtomicU64,
 }
 
 impl fmt::Debug for SpinFreeUdpSocket {
@@ -187,7 +196,13 @@ impl SpinFreeUdpSocket {
         Ok(Self {
             inner: udp::UdpSocketState::new((&socket).into())?,
             io: tokio::net::UdpSocket::from_std(socket)?,
+            received: AtomicU64::new(0),
         })
+    }
+
+    /// Datagrams this socket has delivered to quinn. See the field.
+    pub fn received_datagrams(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 }
 
@@ -252,7 +267,10 @@ impl AsyncUdpSocket for SpinFreeUdpSocket {
             });
 
             match RecvDisposition::of(&result) {
-                RecvDisposition::Deliver(n) => return Poll::Ready(Ok(n)),
+                RecvDisposition::Deliver(n) => {
+                    self.received.fetch_add(n as u64, Ordering::Relaxed);
+                    return Poll::Ready(Ok(n));
+                }
                 RecvDisposition::Park => continue,
                 RecvDisposition::ClearReadinessThenPark => {
                     // THE HEAT. try_io did NOT clear readiness for this error, so returning to the
