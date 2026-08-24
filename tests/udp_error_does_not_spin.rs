@@ -21,17 +21,23 @@
 //! the fix without ever exercising it is worse than none, so it was removed rather than kept.
 //!
 //! Covered instead: the classification, which is where the defect actually lives (quinn treats
-//! every `Err` alike), and the cases that must not break. The device answers the rest — `udperr=`
-//! in the RUNTIME line grows on a network returning ICMP errors, and CPU stays low while it does.
+//! every `Err` alike), and the cases that must not break. The device answers the rest —
+//! `udprecv_err=` in the RUNTIME line grows on a network returning ICMP errors, and CPU stays low
+//! while it does.
+//!
+//! The send direction below is a different story: that error the OS refuses locally, so it can be
+//! staged, and the test that stages it is also what proves the counter is not vacuous.
 
 use std::io;
 use std::io::IoSliceMut;
 use std::net::UdpSocket;
 use std::sync::Arc;
 
-use construct_transport::spin_free_socket::{RecvDisposition, SpinFreeUdpSocket};
+use construct_transport::spin_free_socket::{
+    RecvDisposition, SendDisposition, SpinFreeUdpSocket, send_errors,
+};
 use quinn::AsyncUdpSocket;
-use quinn::udp::RecvMeta;
+use quinn::udp::{RecvMeta, Transmit};
 
 // MARK: - The classification (this is the defect)
 
@@ -69,6 +75,90 @@ fn datagrams_are_delivered_not_swallowed() {
     // working — low CPU, no spin — while taking QUIC down completely.
     assert_eq!(RecvDisposition::of(&Ok(3)), RecvDisposition::Deliver(3));
     assert_eq!(RecvDisposition::of(&Ok(0)), RecvDisposition::Deliver(0));
+}
+
+// MARK: - The send direction (nothing counted it until 2026-08-24)
+
+#[test]
+fn a_send_that_cannot_succeed_is_counted() {
+    for kind in [
+        io::ErrorKind::AddrNotAvailable, // the wrong-address-family case, TODO 59
+        io::ErrorKind::InvalidInput,     // how Darwin can surface the same thing
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::HostUnreachable,
+        io::ErrorKind::BrokenPipe,
+    ] {
+        let result: io::Result<()> = Err(kind.into());
+        assert_eq!(
+            SendDisposition::of(&result),
+            SendDisposition::Failed,
+            "{kind:?} means the datagram did not leave — this is the run that read as udperr=0"
+        );
+    }
+}
+
+#[test]
+fn an_mtu_probe_is_not_a_send_failure() {
+    // Must NOT count. Every connection probes the path MTU with a datagram it expects to be
+    // rejected, so counting EMSGSIZE would report steady send failure on a perfectly healthy link
+    // — the inversion that made `chunk_reassembly_incomplete` unusable.
+    let result: io::Result<()> = Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+    assert_eq!(SendDisposition::of(&result), SendDisposition::ProbeTooLarge);
+}
+
+#[test]
+fn backpressure_is_not_a_send_failure() {
+    // Must NOT count: quinn retries when the write poller reports writable. Counting it would make
+    // a busy uplink indistinguishable from a socket that cannot send, which is the exact confusion
+    // this counter was added to end.
+    let result: io::Result<()> = Err(io::ErrorKind::WouldBlock.into());
+    assert_eq!(SendDisposition::of(&result), SendDisposition::WouldBlock);
+}
+
+#[test]
+fn a_successful_send_is_not_counted() {
+    assert_eq!(SendDisposition::of(&Ok(())), SendDisposition::Sent);
+}
+
+/// The staged version of TODO 59, which the classification tests above cannot reach: a socket
+/// bound to one address family, asked to send to the other. This is what the device did for three
+/// runs while the RUNTIME line said the socket was fine.
+///
+/// Unlike the receive side — where macOS declines to deliver the ICMP over loopback, so the error
+/// could not be staged at all — this one the OS refuses locally and synchronously.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wrong_family_destination_increments_the_counter() {
+    let socket =
+        Arc::new(SpinFreeUdpSocket::bind("127.0.0.1:0".parse().expect("v4 addr")).expect("bind v4"));
+
+    // Wait for write readiness first. `try_io` short-circuits to `WouldBlock` without running the
+    // closure while readiness is unknown, so a bare `try_send` on a fresh socket reports
+    // backpressure and never reaches the OS — the first version of this test asserted on that and
+    // read it as the counter failing.
+    let mut poller = socket.clone().create_io_poller();
+    std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx))
+        .await
+        .expect("socket becomes writable");
+
+    let before = send_errors();
+    let result = socket.try_send(&Transmit {
+        destination: "[::1]:9".parse().expect("v6 addr"),
+        ecn: None,
+        contents: b"unsendable",
+        segment_size: None,
+        src_ip: None,
+    });
+
+    // The return value is deliberately `Ok(())` — one lost datagram must not fail a QUIC
+    // connection, and that was the behaviour before this counter existed. The counter is the
+    // entire observable difference, which is also why asserting on the return value here would
+    // prove nothing.
+    assert!(result.is_ok(), "a lost datagram must not be raised to quinn");
+    assert_eq!(
+        send_errors(),
+        before + 1,
+        "the failure must be counted — an uncounted one is what `udperr=0` was hiding"
+    );
 }
 
 // MARK: - The socket still works

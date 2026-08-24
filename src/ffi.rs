@@ -181,15 +181,25 @@ impl QuicChannel {
 /// step either way, but this says which stack to go looking for.
 #[uniffi::export]
 pub fn transport_runtime_stats() -> String {
-    // `udperr` is the count of receive errors absorbed without spinning the endpoint driver
+    // `udprecv_err` is the count of receive errors absorbed without spinning the endpoint driver
     // (see spin_free_socket). It is expected to be non-zero on a network that returns ICMP
-    // unreachables — that is the condition that used to cost a core. A growing `udperr` next to
-    // low CPU is the fix working; a growing `udperr` next to 100% CPU means it is not.
+    // unreachables — that is the condition that used to cost a core. Growing beside low CPU is the
+    // fix working; growing beside 100% CPU means it is not.
+    //
+    // `udpsend_err` is the other direction and is deliberately not summed into it: "nothing
+    // arrives" and "nothing leaves" are different diagnoses. It was added after an endpoint that
+    // could not send at all was read as healthy for three device runs, because the only counter
+    // there was answered about receiving.
+    //
+    // The receive field was called `udperr` until 2026-08-24. It is renamed rather than left
+    // alongside its new sibling: a field named for UDP errors that carries one direction is the
+    // half of this defect that survives adding the missing counter.
     format!(
-        "conns={} tasks={} udperr={}",
+        "conns={} tasks={} udprecv_err={} udpsend_err={}",
         crate::client::live_connections(),
         RT.metrics().num_alive_tasks(),
-        crate::spin_free_socket::suppressed_socket_errors(),
+        crate::spin_free_socket::suppressed_recv_errors(),
+        crate::spin_free_socket::send_errors(),
     )
 }
 

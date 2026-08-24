@@ -68,7 +68,7 @@ static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 /// Open, not referenced. Until 2026-08-23 only `Drop` decremented this, so a connection retired
 /// through `close()` — which is the path the iOS transport takes on reconnect — kept counting
 /// while a parked stream held the last `Arc`. The device reads that gauge in its RUNTIME line, so
-/// the signature of a *healthy* session was `conns=1` beside a flat `udperr`, which is the exact
+/// the signature of a *healthy* session was `conns=1` beside a flat UDP error count, which is the exact
 /// signature of the leak it exists to detect. A gauge that cannot distinguish the fixed state
 /// from the broken one is worse than no gauge on the run that has to tell them apart.
 pub fn live_connections() -> u32 {
@@ -146,8 +146,10 @@ impl QuicClient {
     /// `quic.konstruct.cc` has an A record and no AAAA, so every datagram failed to leave, the
     /// handshake expired at its 3s timeout, and it read as "UDP is blocked on this path".
     ///
-    /// Nothing contradicted that reading, because `udperr` counts **receive** errors only
-    /// (`spin_free_socket::poll_recv`) — sends that never leave are invisible to it. And it did
+    /// Nothing contradicted that reading, because the only counter there was — printed as
+    /// `udperr` — counted **receive** errors (`spin_free_socket::poll_recv`), so sends that never
+    /// left were invisible to it. Closed 2026-08-24: the field is now `udprecv_err` beside
+    /// `udpsend_err`, and this failure would announce itself. And it did
     /// work occasionally: on a NAT64 carrier network DNS64 synthesises an AAAA, resolution returns
     /// an IPv6 address, and the IPv6 socket sends it happily. One success in five, which read as a
     /// flaky network rather than as the address family it actually was.
@@ -538,8 +540,9 @@ mod bind_family_tests {
     /// v4-mapped, and quinn forwards `Transmit.destination` unchanged. The old code preferred
     /// `[::]:0` and fell back to IPv4 only if the *bind* failed, which it essentially never does,
     /// so on any network resolving `quic.konstruct.cc` (A record, no AAAA) to IPv4 nothing left
-    /// the socket. It read as blocked UDP for three device runs: `udperr` counts receive errors
-    /// only, so sends that never happen leave no trace.
+    /// the socket. It read as blocked UDP for three device runs, because the RUNTIME line's only
+    /// UDP counter answered about receiving, so sends that never happened left no trace. The send
+    /// counter added on 2026-08-24 (`udpsend_err`) is what makes this shape self-reporting.
     ///
     /// Mutation: always return `[::]:0` — restores the bug.
     #[test]

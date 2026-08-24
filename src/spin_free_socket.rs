@@ -52,9 +52,17 @@
 //! The error itself is consumed by the failed `recvmsg` (BSD socket-error semantics), so this
 //! costs one wasted syscall per error rather than millions.
 //!
-//! Errors are counted, not hidden: `suppressed_socket_errors()` feeds the `transport=` field of
+//! Errors are counted, not hidden: `suppressed_recv_errors()` feeds the `transport=` field of
 //! the device RUNTIME line, so a recurrence is visible instead of being inferred from a thermal
 //! reading.
+//!
+//! # The other direction
+//!
+//! That counter is about **receiving**, and until 2026-08-24 it was the only one, under a name
+//! (`suppressed_socket_errors`, printed as `udperr`) that reads as though it covered the socket.
+//! An endpoint bound to the wrong address family could not send a single datagram and the line
+//! still said `udperr=0` — true, and taken for three device runs as evidence the socket was
+//! healthy. `send_errors()` counts the other half, reported beside it and never summed into it.
 
 use std::fmt;
 use std::io;
@@ -69,12 +77,30 @@ use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::io::Interest;
 
 /// Total non-`WouldBlock` receive errors swallowed since process start, across all endpoints.
-static SUPPRESSED_ERRORS: AtomicU64 = AtomicU64::new(0);
+static SUPPRESSED_RECV_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Total non-`WouldBlock` send failures since process start, across all endpoints.
+static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// How many receive errors have been absorbed without spinning. Steady growth means the network
 /// is returning ICMP errors; the point is that it no longer costs a core.
-pub fn suppressed_socket_errors() -> u64 {
-    SUPPRESSED_ERRORS.load(Ordering::Relaxed)
+///
+/// Named for the direction on purpose. It was `suppressed_socket_errors`, which reads as "socket
+/// errors" and counts half of them — the naming half of the defect below.
+pub fn suppressed_recv_errors() -> u64 {
+    SUPPRESSED_RECV_ERRORS.load(Ordering::Relaxed)
+}
+
+/// How many datagrams failed to leave the socket.
+///
+/// Exists because for three device runs nothing counted this. The endpoint had bound the wrong
+/// address family and could not send a single datagram, while the RUNTIME line reported
+/// `udperr=0` — a true statement about receiving, read as "the socket is fine". A gauge named for
+/// UDP errors that counts one direction answers a question nobody asked, and its answer is
+/// reassuring. Kept separate from the receive counter rather than summed: "nothing arrives" and
+/// "nothing leaves" are different diagnoses, and adding them reproduces the lost distinction.
+pub fn send_errors() -> u64 {
+    SEND_ERRORS.load(Ordering::Relaxed)
 }
 
 /// What `poll_recv` must do with the result of one `recv` attempt.
@@ -100,6 +126,37 @@ impl RecvDisposition {
             Ok(n) => Self::Deliver(*n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Self::Park,
             Err(_) => Self::ClearReadinessThenPark,
+        }
+    }
+}
+
+/// What one `send` attempt means for the send-error counter.
+///
+/// Lifted out for the same reason as `RecvDisposition`: the thing that can be wrong here is the
+/// classification, not the algorithm. Two of the four cases must **not** be counted, and both are
+/// ordinary traffic — counting either would put a healthy connection into the gauge and bury the
+/// case it exists for, which is the inversion `ios-semantic-divergence-signals` rule 1a is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendDisposition {
+    /// The datagram left the socket.
+    Sent,
+    /// Backpressure, not a failure. quinn retries when the write poller reports writable.
+    WouldBlock,
+    /// `EMSGSIZE` — a path-MTU probe that was deliberately too large. Every connection makes
+    /// these, and quinn treats them as success (`quinn_udp::UdpSocketState::send`). Counting them
+    /// would report MTU discovery as send failure on every healthy connection.
+    ProbeTooLarge,
+    /// The datagram did not leave and will not: no route, wrong address family, socket shut down.
+    Failed,
+}
+
+impl SendDisposition {
+    pub fn of(result: &io::Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Sent,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Self::WouldBlock,
+            Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Self::ProbeTooLarge,
+            Err(_) => Self::Failed,
         }
     }
 }
@@ -155,10 +212,31 @@ impl AsyncUdpSocket for SpinFreeUdpSocket {
         Box::pin(WritablePoller(self))
     }
 
+    /// Sends, and — unlike every version before 2026-08-24 — notices when it could not.
+    ///
+    /// This calls `quinn_udp`'s `try_send`, not its `send`, and the difference is the whole point.
+    /// `send` maps every error except `WouldBlock` to `Ok(())` (`unix.rs:207`): it logs through the
+    /// `log` crate and reports success. So a counter written the obvious way — classify the result
+    /// of `send` — would have read zero on a socket that could not transmit at all, which is the
+    /// same false reassurance as the missing counter, dressed as a fix.
+    ///
+    /// What we return to quinn is unchanged: `Ok(())` for the swallowed classes, the `WouldBlock`
+    /// through so the write poller does its job. A single lost datagram must not fail a connection
+    /// — QUIC recovers from that by design — so the swallow policy is reproduced deliberately here
+    /// rather than tightened as a side effect of adding a gauge.
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        self.io.try_io(Interest::WRITABLE, || {
-            self.inner.send((&self.io).into(), transmit)
-        })
+        let result = self.io.try_io(Interest::WRITABLE, || {
+            self.inner.try_send((&self.io).into(), transmit)
+        });
+
+        match SendDisposition::of(&result) {
+            SendDisposition::Sent | SendDisposition::ProbeTooLarge => Ok(()),
+            SendDisposition::WouldBlock => result,
+            SendDisposition::Failed => {
+                SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
     }
 
     fn poll_recv(
@@ -181,7 +259,7 @@ impl AsyncUdpSocket for SpinFreeUdpSocket {
                     // top of the loop would find the socket "ready" again instantly and burn a
                     // core. Report WouldBlock without doing any I/O — that is what tells tokio the
                     // socket is not actually ready — then park like any other empty socket.
-                    SUPPRESSED_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    SUPPRESSED_RECV_ERRORS.fetch_add(1, Ordering::Relaxed);
                     let _ = self.io.try_io(Interest::READABLE, || {
                         Err::<(), io::Error>(io::ErrorKind::WouldBlock.into())
                     });

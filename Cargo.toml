@@ -48,6 +48,11 @@ rand = "0.8"
 # (already in the tree transitively via rustls/quinn).
 ring = "0.17"
 
+# EMSGSIZE, to tell an MTU probe apart from a send that failed (spin_free_socket).
+# The value differs per platform, so it cannot be written as a literal. Already in
+# the tree transitively via quinn-udp.
+libc = "0.2"
+
 [dev-dependencies]
 # h2c echo upstream (stands in for envoy) in the proxy integration test
 hyper = { version = "1", features = ["server", "http2"] }
