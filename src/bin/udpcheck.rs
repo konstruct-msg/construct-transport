@@ -452,9 +452,11 @@ async fn main() -> Result<()> {
                     // like an SNI-keyed block on us. Validate the name before believing the test.
                     println!("         BUT this run proves nothing until \"{s}\" is cleared as a");
                     println!("         substitute: a name that is itself blocked over QUIC here");
-                    println!("         fails the same way. Check it against its own host first:");
-                    println!("           cargo run --bin udpcheck -- {s} 443 --hold 45");
-                    println!("         If that also fails, pick a different name and re-run.");
+                    println!("         fails the same way.");
+                    println!("         USE THE CONTROL HOST AS THE SUBSTITUTE — the same run has");
+                    println!("         just proved it reaches this network over QUIC, so it needs");
+                    println!("         no separate clearing:");
+                    println!("           cargo run --bin udpcheck -- --sni {CONTROL_HOST} --hold 45");
                     println!("         (Our gateway does not select on SNI — one cert for every");
                     println!("         name, tls::server_config — so it is not the one refusing.)");
                 } else {
@@ -480,10 +482,14 @@ async fn main() -> Result<()> {
                 println!("           1. the path drops our flow (targeted by SNI or by our IP);");
                 println!("           2. our gateway stops answering a few seconds in.");
                 println!("         SEPARATE THEM by running this same command from OUTSIDE this");
-                println!("         network — the gateway host itself, or any other machine:");
+                println!("         network — another machine, the gateway host, or simply this");
+                println!("         one with a VPN up, which changes the path and nothing else:");
                 println!("           cargo run --bin udpcheck -- {ours_host} {ours_port} --hold 45");
                 println!("         Survives there ⇒ (1), this network. Dies there too ⇒ (2), ours.");
-                println!("         Only once it is (1): --sni <benign> / --psk <key> to find which.");
+                println!("         Once it is (1), find the key with the CONTROL host as the SNI");
+                println!("         substitute — this run already proved that name reaches here:");
+                println!("           cargo run --bin udpcheck -- --sni {CONTROL_HOST} --hold 45");
+                println!("         Survives ⇒ keyed on SNI. Dies ⇒ keyed on our destination IP.");
                 println!("         The app uses H2 meanwhile.");
             }
             (true, true) if control_throttled => {
