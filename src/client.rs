@@ -235,7 +235,6 @@ impl QuicClient {
     /// Run the QUIC handshake on an already-bound `endpoint` and start the h3 driver.
     /// Shared by the plain and obfuscated connect paths — only the endpoint differs.
     async fn handshake(endpoint: Endpoint, addr: SocketAddr, server_name: &str) -> Result<Self> {
-
         // Every early return from here on must close the endpoint. A failed attempt leaves no
         // connection behind, so nothing else will ever stop its driver — and a handshake failing
         // is exactly the situation (blocked UDP) that makes that driver spin. See `close_endpoint`.
@@ -547,7 +546,10 @@ mod bind_family_tests {
     fn an_ipv4_peer_gets_an_ipv4_socket() {
         let peer: SocketAddr = "152.42.130.140:443".parse().unwrap();
         let bind = QuicClient::bind_addr_for(peer);
-        assert!(bind.is_ipv4(), "IPv4 peer must be reached from an IPv4 socket, got {bind}");
+        assert!(
+            bind.is_ipv4(),
+            "IPv4 peer must be reached from an IPv4 socket, got {bind}"
+        );
         assert_eq!(bind.port(), 0, "the port must stay ephemeral");
     }
 
@@ -560,7 +562,10 @@ mod bind_family_tests {
     fn an_ipv6_peer_gets_an_ipv6_socket() {
         let peer: SocketAddr = "[64:ff9b::9852:828c]:443".parse().unwrap();
         let bind = QuicClient::bind_addr_for(peer);
-        assert!(bind.is_ipv6(), "IPv6 peer must be reached from an IPv6 socket, got {bind}");
+        assert!(
+            bind.is_ipv6(),
+            "IPv6 peer must be reached from an IPv6 socket, got {bind}"
+        );
         assert_eq!(bind.port(), 0);
     }
 

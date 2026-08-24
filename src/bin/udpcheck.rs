@@ -444,7 +444,10 @@ async fn main() -> Result<()> {
             }
             Probe::Fail(e) => {
                 println!("VERDICT: with {mode}, the handshake to our gateway FAILED: {e}");
-                println!("         Control was {}.", if control_ok { "OK" } else { "also down" });
+                println!(
+                    "         Control was {}.",
+                    if control_ok { "OK" } else { "also down" }
+                );
                 if let Some(s) = &sni {
                     // The substitute name is not a neutral instrument. A name that is itself
                     // QUIC-blocked on this network (www.google.com on RU networks, for one)
@@ -456,11 +459,15 @@ async fn main() -> Result<()> {
                     println!("         USE THE CONTROL HOST AS THE SUBSTITUTE — the same run has");
                     println!("         just proved it reaches this network over QUIC, so it needs");
                     println!("         no separate clearing:");
-                    println!("           cargo run --bin udpcheck -- --sni {CONTROL_HOST} --hold 45");
+                    println!(
+                        "           cargo run --bin udpcheck -- --sni {CONTROL_HOST} --hold 45"
+                    );
                     println!("         (Our gateway does not select on SNI — one cert for every");
                     println!("         name, tls::server_config — so it is not the one refusing.)");
                 } else {
-                    println!("         Check the gateway serves this mode on {ours_host}:{ours_port}");
+                    println!(
+                        "         Check the gateway serves this mode on {ours_host}:{ours_port}"
+                    );
                     println!("         (--psk needs the matching QUIC_OBF_PSK listener).");
                 }
             }
@@ -484,8 +491,12 @@ async fn main() -> Result<()> {
                 println!("         SEPARATE THEM by running this same command from OUTSIDE this");
                 println!("         network — another machine, the gateway host, or simply this");
                 println!("         one with a VPN up, which changes the path and nothing else:");
-                println!("           cargo run --bin udpcheck -- {ours_host} {ours_port} --hold 45");
-                println!("         Survives there ⇒ (1), this network. Dies there too ⇒ (2), ours.");
+                println!(
+                    "           cargo run --bin udpcheck -- {ours_host} {ours_port} --hold 45"
+                );
+                println!(
+                    "         Survives there ⇒ (1), this network. Dies there too ⇒ (2), ours."
+                );
                 println!("         Once it is (1), find the key with the CONTROL host as the SNI");
                 println!("         substitute — this run already proved that name reaches here:");
                 println!("           cargo run --bin udpcheck -- --sni {CONTROL_HOST} --hold 45");
