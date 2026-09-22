@@ -9,7 +9,10 @@
 //! clears socket readiness only for `WouldBlock` — so the driver is re-polled instantly, forever.
 //! On Darwin an ICMP unreachable arrives as exactly that kind of pending socket error.
 //!
-//! The earlier `Endpoint::close` fix does not cover this: nothing here is being torn down.
+//! Clearing readiness by returning a synthetic `WouldBlock` is not a valid repair: tokio requires
+//! that value to come from a real I/O attempt, and a persistent socket error can wake the endpoint
+//! again forever. A real receive error therefore has one bounded outcome: fail the endpoint poll
+//! and let its owner recover or fall back.
 //!
 //! # What is and is not covered
 //!
@@ -22,8 +25,7 @@
 //!
 //! Covered instead: the classification, which is where the defect actually lives (quinn treats
 //! every `Err` alike), and the cases that must not break. The device answers the rest —
-//! `udprecv_err=` in the RUNTIME line grows on a network returning ICMP errors, and CPU stays low
-//! while it does.
+//! `udprecv_err=` in the RUNTIME line records the endpoint failure and CPU stays low.
 //!
 //! The send direction below is a different story: that error the OS refuses locally, so it can be
 //! staged, and the test that stages it is also what proves the counter is not vacuous.
@@ -34,7 +36,7 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 
 use construct_transport::spin_free_socket::{
-    RecvDisposition, SendDisposition, SpinFreeUdpSocket, send_errors,
+    RecvDisposition, SendDisposition, SpinFreeUdpSocket, endpoint_receive_error, send_errors,
 };
 use quinn::AsyncUdpSocket;
 use quinn::udp::{RecvMeta, Transmit};
@@ -42,9 +44,9 @@ use quinn::udp::{RecvMeta, Transmit};
 // MARK: - The classification (this is the defect)
 
 #[test]
-fn a_real_socket_error_must_clear_readiness_before_parking() {
-    // The whole bug in one assertion. quinn's loop treats these identically to WouldBlock, and
-    // because try_io left the socket marked ready, the next poll returns instantly — forever.
+fn a_real_socket_error_must_fail_the_endpoint_poll() {
+    // The whole bug in one assertion. Treating these as backpressure keeps a persistent socket
+    // error inside one poll invocation, where neither endpoint shutdown nor fallback can run.
     for kind in [
         io::ErrorKind::ConnectionRefused, // ICMP port unreachable — the Darwin case
         io::ErrorKind::HostUnreachable,
@@ -55,10 +57,27 @@ fn a_real_socket_error_must_clear_readiness_before_parking() {
         let result: io::Result<usize> = Err(kind.into());
         assert_eq!(
             RecvDisposition::of(&result),
-            RecvDisposition::ClearReadinessThenPark,
-            "{kind:?} must clear readiness — this is the 111% CPU / thermal `serious` case"
+            RecvDisposition::FailEndpoint,
+            "{kind:?} must leave the receive loop — this is the 192% CPU / orphan-task case"
         );
     }
+}
+
+#[test]
+fn connection_reset_is_terminal_even_though_quinn_normally_ignores_it() {
+    let error = endpoint_receive_error(io::ErrorKind::ConnectionReset.into());
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::Other,
+        "quinn retries ConnectionReset inside the same poll; the socket wrapper must not expose it"
+    );
+
+    let refused = endpoint_receive_error(io::ErrorKind::ConnectionRefused.into());
+    assert_eq!(
+        refused.kind(),
+        io::ErrorKind::ConnectionRefused,
+        "ordinary endpoint failures must retain their diagnostic kind"
+    );
 }
 
 #[test]

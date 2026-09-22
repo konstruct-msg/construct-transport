@@ -20,8 +20,7 @@
 //! as the CPU allows — for as long as the app is foregrounded.
 //!
 //! On Darwin a UDP socket surfaces ICMP unreachables as a pending socket error, which is exactly
-//! the shape of error that hits this path. The connection itself keeps working; one core simply
-//! burns beside it.
+//! the shape of error that hits this path.
 //!
 //! Device evidence, iPhone, Time Profiler, 2026-08-10 — with a **live, healthy** QUIC connection
 //! (`transport=conns=1 tasks=5`, `tx_pkts`/`rx_pkts` both climbing) and the app at 111% CPU,
@@ -38,21 +37,25 @@
 //!           std::io::error::Error::kind             0.4%   ← the WouldBlock check
 //! ```
 //!
+//! A second device run on 2026-09-21 showed why parking was not a sufficient contract: after
+//! graceful QUIC closes, `conns=0 tasks=4 udprecv_err=2062884166` while CPU reached 192.5%.
+//! The error counter was advancing by roughly five million per second and four endpoint tasks
+//! survived with no connections. The receive poll had become the owner of the worker threads.
+//!
 //! An earlier fix (`Endpoint::close` on teardown, 2026-08-10) addressed a different case — an
 //! endpoint left running after a failed handshake — and did not touch this one, because here
 //! nothing is being torn down. The connection is in use and expected to stay.
 //!
 //! # The fix
 //!
-//! On a non-`WouldBlock` error, tell tokio the socket is not ready before looping. A closure that
-//! reports `WouldBlock` without performing any I/O is precisely how `try_io` is documented to be
-//! told that — it clears readiness and the driver parks until the next kqueue event instead of
-//! re-polling immediately.
+//! A real socket error terminates this endpoint poll. It is not backpressure, and manufacturing a
+//! `WouldBlock` result without an I/O attempt violates `tokio::net::UdpSocket::try_io`'s contract.
+//! Worse, a pending Darwin socket error can remain signalled: clearing readiness and retrying can
+//! therefore wake immediately forever while preventing quinn's endpoint driver from observing
+//! shutdown. Returning the error gives the endpoint one bounded outcome and lets its owner use the
+//! existing reconnect / H2 fallback path.
 //!
-//! The error itself is consumed by the failed `recvmsg` (BSD socket-error semantics), so this
-//! costs one wasted syscall per error rather than millions.
-//!
-//! Errors are counted, not hidden: `suppressed_recv_errors()` feeds the `transport=` field of
+//! Errors are counted before they are returned: `recv_errors()` feeds the `transport=` field of
 //! the device RUNTIME line, so a recurrence is visible instead of being inferred from a thermal
 //! reading.
 //!
@@ -76,19 +79,15 @@ use quinn::udp;
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::io::Interest;
 
-/// Total non-`WouldBlock` receive errors swallowed since process start, across all endpoints.
-static SUPPRESSED_RECV_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Total non-`WouldBlock` receive errors since process start, across all endpoints.
+static RECV_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// Total non-`WouldBlock` send failures since process start, across all endpoints.
 static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 
-/// How many receive errors have been absorbed without spinning. Steady growth means the network
-/// is returning ICMP errors; the point is that it no longer costs a core.
-///
-/// Named for the direction on purpose. It was `suppressed_socket_errors`, which reads as "socket
-/// errors" and counts half of them — the naming half of the defect below.
-pub fn suppressed_recv_errors() -> u64 {
-    SUPPRESSED_RECV_ERRORS.load(Ordering::Relaxed)
+/// How many receive errors terminated an endpoint poll instead of being retried in place.
+pub fn recv_errors() -> u64 {
+    RECV_ERRORS.load(Ordering::Relaxed)
 }
 
 /// How many datagrams failed to leave the socket.
@@ -115,9 +114,8 @@ pub enum RecvDisposition {
     Deliver(usize),
     /// `try_io` already cleared readiness for us. Loop and park.
     Park,
-    /// A real socket error — Darwin surfaces ICMP unreachables this way. `try_io` did **not**
-    /// clear readiness, so looping without clearing it re-polls immediately and pins a core.
-    ClearReadinessThenPark,
+    /// A real socket error. End this endpoint poll so the owner can recover or fall back.
+    FailEndpoint,
 }
 
 impl RecvDisposition {
@@ -125,8 +123,21 @@ impl RecvDisposition {
         match result {
             Ok(n) => Self::Deliver(*n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Self::Park,
-            Err(_) => Self::ClearReadinessThenPark,
+            Err(_) => Self::FailEndpoint,
         }
+    }
+}
+
+/// Quinn deliberately ignores `ConnectionReset` while receiving UDP because a peer can inject it.
+/// That policy assumes the error is transient. A persistent Darwin socket error would therefore
+/// put us back in the same in-place retry loop, one level higher. Preserve every other error kind,
+/// but make this one terminal to the endpoint driver too.
+#[cold]
+pub fn endpoint_receive_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::ConnectionReset {
+        std::io::Error::other(error)
+    } else {
+        error
     }
 }
 
@@ -272,16 +283,14 @@ impl AsyncUdpSocket for SpinFreeUdpSocket {
                     return Poll::Ready(Ok(n));
                 }
                 RecvDisposition::Park => continue,
-                RecvDisposition::ClearReadinessThenPark => {
-                    // THE HEAT. try_io did NOT clear readiness for this error, so returning to the
-                    // top of the loop would find the socket "ready" again instantly and burn a
-                    // core. Report WouldBlock without doing any I/O — that is what tells tokio the
-                    // socket is not actually ready — then park like any other empty socket.
-                    SUPPRESSED_RECV_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    let _ = self.io.try_io(Interest::READABLE, || {
-                        Err::<(), io::Error>(io::ErrorKind::WouldBlock.into())
-                    });
-                    continue;
+                RecvDisposition::FailEndpoint => {
+                    // A real error is not a readiness hint. Returning it is both bounded and
+                    // faithful to `try_io`'s contract; quinn can now retire the endpoint instead
+                    // of this single poll invocation monopolising a runtime worker forever.
+                    RECV_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    let error = result
+                        .expect_err("BUG: FailEndpoint is classified only from a receive error");
+                    return Poll::Ready(Err(endpoint_receive_error(error)));
                 }
             }
         }
