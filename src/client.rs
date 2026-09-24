@@ -152,15 +152,17 @@ impl QuicClient {
     ) -> Result<Self> {
         let client_config = tls::client_config(&Self::trust_bundle(trust_cert))?;
 
-        let addr = Self::resolve(host, port).await?;
-        let recipe = SocketRecipe {
-            bind: Self::bind_addr_for(addr),
-            obf: None,
-        };
-        let mut endpoint = Self::bind_endpoint(recipe.bind).context("bind client endpoint")?;
-        endpoint.set_default_client_config(client_config);
-
-        Self::handshake(endpoint, recipe, addr, server_name).await
+        let candidates = Self::resolve_all(host, port).await?;
+        Self::dial(candidates, server_name, |addr| {
+            let recipe = SocketRecipe {
+                bind: Self::bind_addr_for(addr),
+                obf: None,
+            };
+            let mut endpoint = Self::bind_endpoint(recipe.bind).context("bind client endpoint")?;
+            endpoint.set_default_client_config(client_config.clone());
+            Ok((endpoint, recipe))
+        })
+        .await
     }
 
     /// The local address to bind so this destination is reachable from the socket.
@@ -209,16 +211,18 @@ impl QuicClient {
 
         // Same family rule as the plain path — see `bind_addr_for`.
         let obf = Salamander::new(psk);
-        let addr = Self::resolve(host, port).await?;
-        let recipe = SocketRecipe {
-            bind: Self::bind_addr_for(addr),
-            obf: Some(obf.clone()),
-        };
-        let mut endpoint = obf_socket::obfuscated_client_endpoint(recipe.bind, obf)
-            .context("bind obfuscated client endpoint")?;
-        endpoint.set_default_client_config(client_config);
-
-        Self::handshake(endpoint, recipe, addr, server_name).await
+        let candidates = Self::resolve_all(host, port).await?;
+        Self::dial(candidates, server_name, |addr| {
+            let recipe = SocketRecipe {
+                bind: Self::bind_addr_for(addr),
+                obf: Some(obf.clone()),
+            };
+            let mut endpoint = obf_socket::obfuscated_client_endpoint(recipe.bind, obf.clone())
+                .context("bind obfuscated client endpoint")?;
+            endpoint.set_default_client_config(client_config.clone());
+            Ok((endpoint, recipe))
+        })
+        .await
     }
 
     /// Bind a client endpoint on our own socket rather than `Endpoint::client`.
@@ -247,43 +251,117 @@ impl QuicClient {
         }
     }
 
+    /// Every address the resolver returned, in the order it returned them, without duplicates.
+    ///
+    /// Order is the resolver's, not ours. Sorting IPv4 first would dial a blackhole on a
+    /// NAT64 network whose only working address is the synthesised AAAA, and that AAAA is
+    /// often the first answer. The 2026-08-24 failure was the socket family, not the order.
+    fn dial_candidates(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        for addr in addrs {
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+        out
+    }
+
+    /// How many of `candidates` to dial, and how long each one gets.
+    ///
+    /// One address gets the whole handshake budget — a censored path must still be able to
+    /// burn it, and a short single-address timeout would turn a slow success into a failure.
+    /// More than one splits that same budget. The split has a floor: an attempt shorter than
+    /// a few of the measured ~85ms round trips cannot succeed, so a resolver that returns a
+    /// long list does not get to shrink every attempt below that, and does not get to run
+    /// past the budget either.
+    fn dial_plan(candidate_count: usize) -> (usize, Duration) {
+        const MIN_ATTEMPT: Duration = Duration::from_millis(250);
+        let max_fits = (HANDSHAKE_TIMEOUT.as_millis() / MIN_ATTEMPT.as_millis()).max(1) as usize;
+        let n = candidate_count.max(1).min(max_fits);
+        (n, HANDSHAKE_TIMEOUT / n as u32)
+    }
+
     /// Name resolution: async, bounded, and reported under its own name.
     ///
     /// It used to be a blocking `to_socket_addrs()` inside `handshake` and *outside*
     /// `HANDSHAKE_TIMEOUT` — a getaddrinfo blocking a tokio worker with no deadline of its own,
     /// whose failures surfaced as "QUIC handshake timed out" because that was the only error the
-    /// caller could reach.
+    /// caller could reach. It then kept only `.next()`. TCP on the same device races the list;
+    /// a first address that does not answer looks exactly like "UDP/443 is silent" while H2
+    /// to the same name succeeds in the same second.
     ///
-    /// It now also runs **before** the socket is bound, because the resolved address decides the
+    /// It runs **before** the socket is bound, because each resolved address decides its own
     /// socket family. See `bind_addr_for`.
-    async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
-        tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
+    async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        let found = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
             .with_context(|| format!("DNS timed out for {host}:{port}"))?
-            .with_context(|| format!("resolve {host}:{port}"))?
-            .next()
-            .ok_or_else(|| anyhow!("no address for {host}:{port}"))
+            .with_context(|| format!("resolve {host}:{port}"))?;
+        let candidates = Self::dial_candidates(found);
+        if candidates.is_empty() {
+            anyhow::bail!("no address for {host}:{port}");
+        }
+        Ok(candidates)
+    }
+
+    /// Dial `candidates` in order. The first handshake that completes wins; each loser closes
+    /// its endpoint before the next one is bound.
+    async fn dial(
+        candidates: Vec<SocketAddr>,
+        server_name: &str,
+        mut open: impl FnMut(SocketAddr) -> Result<(Endpoint, SocketRecipe)>,
+    ) -> Result<Self> {
+        let (n, budget) = Self::dial_plan(candidates.len());
+        let mut failures = Vec::new();
+        for addr in candidates.into_iter().take(n) {
+            let (endpoint, recipe) = match open(addr) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    failures.push(format!("{addr}: {e:#}"));
+                    continue;
+                }
+            };
+            match Self::handshake(endpoint, recipe, addr, server_name, budget).await {
+                Ok(client) => return Ok(client),
+                Err(e) => failures.push(format!("{e:#}")),
+            }
+        }
+        Err(anyhow!(
+            "QUIC handshake failed ({})",
+            if failures.is_empty() {
+                "no address".to_string()
+            } else {
+                failures.join("; ")
+            }
+        ))
     }
 
     /// Run the QUIC handshake on an already-bound `endpoint` and start the h3 driver.
     /// Shared by the plain and obfuscated connect paths — only the endpoint differs.
+    ///
+    /// `budget` is this address's slice of [`HANDSHAKE_TIMEOUT`], not a second copy of it.
     async fn handshake(
         endpoint: Endpoint,
         socket_recipe: SocketRecipe,
         addr: SocketAddr,
         server_name: &str,
+        budget: Duration,
     ) -> Result<Self> {
         // Every early return from here on must close the endpoint. A failed attempt leaves no
         // connection behind, so nothing else will ever stop its driver — and a handshake failing
         // is exactly the situation (blocked UDP) that makes that driver spin. See `close_endpoint`.
+        //
+        // The address is in the error because "handshake timed out" without it cannot be told
+        // from a resolver that handed us a different peer than the one H2 just reached. The
+        // interface is logged by the caller; this is the other half of the same line.
         let attempt = async {
             let connecting = endpoint
                 .connect(addr, server_name)
                 .context("start connect")?;
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+            tokio::time::timeout(budget, connecting)
                 .await
-                .context("QUIC handshake timed out")?
-                .context("QUIC handshake failed")
+                .with_context(|| format!("QUIC handshake timed out to {addr}"))?
+                .with_context(|| format!("QUIC handshake failed to {addr}"))
         };
         let conn = match attempt.await {
             Ok(conn) => conn,
@@ -294,7 +372,17 @@ impl QuicClient {
         };
 
         let conn_for_stats = conn.clone();
-        let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
+        // Same rule as the handshake error above: a failure here is an early return, and the
+        // next address in `dial` is about to bind another endpoint. Leaving this one running
+        // is the spin `close_endpoint` exists to stop.
+        let (mut driver, send_request) =
+            match h3::client::new(h3_quinn::Connection::new(conn)).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    Self::close_endpoint(&endpoint);
+                    return Err(e.into());
+                }
+            };
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
@@ -355,7 +443,10 @@ impl QuicClient {
         self.endpoint
             .rebind_abstract(socket.endpoint_socket)
             .context("rebind endpoint")?;
-        let local = self.endpoint.local_addr().context("local addr after rebind")?;
+        let local = self
+            .endpoint
+            .local_addr()
+            .context("local addr after rebind")?;
 
         let deadline = tokio::time::Instant::now() + MIGRATION_PROOF_BUDGET;
         loop {
@@ -702,5 +793,49 @@ mod bind_family_tests {
             "resolution is one round trip and the handshake is at least one — a resolve budget \
              at or above the handshake's spends the window on the cheaper phase"
         );
+    }
+
+    /// One address is the censored-network case (the gateway publishes a single A record).
+    /// It must still receive the whole handshake budget. Splitting a list of one is how a
+    /// slow-but-real handshake would start failing on networks where it works today.
+    #[test]
+    fn one_address_keeps_the_whole_handshake_budget() {
+        let (n, budget) = QuicClient::dial_plan(1);
+        assert_eq!(n, 1);
+        assert_eq!(budget, HANDSHAKE_TIMEOUT);
+    }
+
+    /// Two addresses share the budget; they do not each get another copy of it, and they
+    /// do not run past it. The measured success is ~85ms, so half of a second still holds one.
+    #[test]
+    fn two_addresses_share_one_budget() {
+        let (n, budget) = QuicClient::dial_plan(2);
+        assert_eq!(n, 2);
+        assert!(budget * 2 <= HANDSHAKE_TIMEOUT);
+        assert!(budget >= Duration::from_millis(250));
+    }
+
+    /// A long resolver list must not stretch the dial past the budget the caller already
+    /// stopped waiting on, and must not shrink an attempt below a few round trips.
+    #[test]
+    fn a_long_list_does_not_outrun_or_starve_the_budget() {
+        let (n, budget) = QuicClient::dial_plan(10);
+        assert!(n >= 1);
+        assert!(n < 10, "not every address of a long list is dialed");
+        assert!(budget * n as u32 <= HANDSHAKE_TIMEOUT);
+        assert!(budget >= Duration::from_millis(250));
+    }
+
+    /// Resolver order is kept, duplicates are not dialed twice.
+    ///
+    /// Putting IPv4 first would blackhole a NAT64 network whose working address is the
+    /// synthesised AAAA, and that AAAA is the one the resolver listed first. The family
+    /// bug was the socket, not this order.
+    #[test]
+    fn dial_candidates_keep_resolver_order() {
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let got = QuicClient::dial_candidates([v6, v4, v6]);
+        assert_eq!(got, vec![v6, v4]);
     }
 }
