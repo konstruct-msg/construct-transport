@@ -31,8 +31,9 @@ async fn a_live_stream_survives_the_socket_being_replaced() -> Result<()> {
 
     let bundle = tls::self_signed(vec!["localhost".to_string()])?;
     let cert = bundle.cert.as_ref().to_vec();
-    let server = echo_server::spawn_echo_server(tls::server_config(&bundle)?, "127.0.0.1:0".parse()?)
-        .await?;
+    let server =
+        echo_server::spawn_echo_server(tls::server_config(&bundle)?, "127.0.0.1:0".parse()?)
+            .await?;
 
     let client = QuicClient::connect("127.0.0.1", server.addr.port(), "localhost", cert).await?;
     let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
@@ -133,8 +134,9 @@ async fn a_migration_the_peer_cannot_answer_is_reported() -> Result<()> {
 
     let bundle = tls::self_signed(vec!["localhost".to_string()])?;
     let cert = bundle.cert.as_ref().to_vec();
-    let server = echo_server::spawn_echo_server(tls::server_config(&bundle)?, "127.0.0.1:0".parse()?)
-        .await?;
+    let server =
+        echo_server::spawn_echo_server(tls::server_config(&bundle)?, "127.0.0.1:0".parse()?)
+            .await?;
 
     let client = QuicClient::connect("127.0.0.1", server.addr.port(), "localhost", cert).await?;
     let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;

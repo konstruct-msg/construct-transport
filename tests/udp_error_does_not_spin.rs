@@ -147,8 +147,9 @@ fn a_successful_send_is_not_counted() {
 /// could not be staged at all — this one the OS refuses locally and synchronously.
 #[tokio::test(flavor = "current_thread")]
 async fn a_wrong_family_destination_increments_the_counter() {
-    let socket =
-        Arc::new(SpinFreeUdpSocket::bind("127.0.0.1:0".parse().expect("v4 addr")).expect("bind v4"));
+    let socket = Arc::new(
+        SpinFreeUdpSocket::bind("127.0.0.1:0".parse().expect("v4 addr")).expect("bind v4"),
+    );
 
     // Wait for write readiness first. `try_io` short-circuits to `WouldBlock` without running the
     // closure while readiness is unknown, so a bare `try_send` on a fresh socket reports
@@ -172,7 +173,10 @@ async fn a_wrong_family_destination_increments_the_counter() {
     // connection, and that was the behaviour before this counter existed. The counter is the
     // entire observable difference, which is also why asserting on the return value here would
     // prove nothing.
-    assert!(result.is_ok(), "a lost datagram must not be raised to quinn");
+    assert!(
+        result.is_ok(),
+        "a lost datagram must not be raised to quinn"
+    );
     assert_eq!(
         send_errors(),
         before + 1,
