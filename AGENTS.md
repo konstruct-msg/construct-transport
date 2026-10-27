@@ -51,7 +51,7 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
 8. **The effect is the proof.** A transport fix is verified by `udpcheck` / `probe` against the real endpoint and by the counters, not by a build exit code. Heat or battery claims are read from the runtime line (`udperr`), not inferred.
 9. **A test must be able to fail.** Break the behaviour on purpose and watch the test go red before trusting it; `cargo test` must show `Compiling` (see Toolchain).
 10. **Depth before breadth.** No new transport (MASQUE, P2P, new obfuscation) while plain QUIC with H2 fallback is not boring on devices.
-11. **A temporary exception has an end date and a check.** Experimental flags and the Salamander debug path name what removes them.
+11. **A temporary exception has an end date and a check.** The Salamander path names what would remove it.
 12. **Branch and PR, always;** see Git.
 
 **Three questions before a change to the delivery path lands**, answered in the commit message: (1) what does the network, the server or a relay learn that it did not before (SNI, packet sizes, timing, endpoint addresses); (2) what can a party withhold or substitute that it could not before; (3) which trust boundary moves, and which way. An honest "something" is a `decisions/` note, not a merge.
@@ -62,7 +62,7 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
 
 - **Toolchain is pinned** in `rust-toolchain.toml` (1.96.0) and equals `rust-version` in `Cargo.toml`; raise both together. With a toolchain older than `rust-version`, `cargo test` re-ran a stale binary and reported green for source never compiled.
 - **UDP receive errors terminate the endpoint**; `spin_free_socket` stops the spin on an error but does not ask why the socket is still polled. An abandoned endpoint heats the device — a `QuicChannel` must be closed by its owner (`close()` once had no caller).
-- **Plain QUIC is the production default**; Salamander is DEBUG-only and release forces the flags, ignoring `UserDefaults`.
+- **Plain QUIC is the production default.** The gateway obfuscates with Salamander only when `QUIC_OBF_PSK` is set (`src/bin/gateway.rs`); unset means plain. The iOS client keeps Salamander behind DEBUG.
 - **Native h3 server, no Traefik bridge**: bidirectional gRPC over h3 silent-fails through a QUIC↔h2c bridge. The `gateway` is the h3 → h2c proxy; H2 is the fallback.
 - **Pure-ring crypto** (no `aws-lc-rs`), so the Docker builder needs no cmake/clang. Keep it that way.
 - **`bindings/` is generated** by `uniffi-bindgen` 0.30 (`./build_ios.sh --bindings`); never hand-edit. A new FFI export updates the bindings and the app in the same change.
