@@ -9,6 +9,10 @@
 #   ./build_ios.sh --ios        # iOS device only (arm64)
 #   ./build_ios.sh --sim        # iOS Simulator only (arm64 + x86_64 fat)
 #   ./build_ios.sh --mac        # macOS native (arm64)
+#   ./build_ios.sh --dist       # macOS arm64 + x86_64 in one slice (Intel DMG); implies --mac
+#
+# MESSENGER_ROOT: the messenger checkout to write into (a worktree); default
+# ../construct-messenger.
 #   ./build_ios.sh --bindings   # regenerate Swift bindings only
 #   ./build_ios.sh --clean      # cargo clean first
 #   ./build_ios.sh --debug      # debug profile
@@ -35,15 +39,15 @@ hdr()  { echo -e "\n${BOLD}━━━  $1  ━━━${NC}"; }
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 TRANSPORT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MESSENGER_ROOT="$(cd "$TRANSPORT_ROOT/../construct-messenger" 2>/dev/null && pwd)" || \
-  fail "construct-messenger not found next to construct-transport."
+MESSENGER_ROOT="$(cd "${MESSENGER_ROOT:-$TRANSPORT_ROOT/../construct-messenger}" 2>/dev/null && pwd)" || \
+  fail "construct-messenger not found (set MESSENGER_ROOT, or check it out next to construct-transport)."
 XCFW_DEST="$MESSENGER_ROOT/ConstructTransport.xcframework"
 SWIFT_DEST="$MESSENGER_ROOT/ConstructMessenger"
 TMP="$TRANSPORT_ROOT/.build_tmp"
 LIB="libconstruct_transport"
 
 # ── Args ──────────────────────────────────────────────────────────────────────
-BUILD_IOS=false; BUILD_SIM=false; BUILD_MAC=false
+BUILD_IOS=false; BUILD_SIM=false; BUILD_MAC=false; BUILD_DIST=false
 HAS_PLATFORM_FLAG=false; BINDINGS_ONLY=false; DO_CLEAN=false
 PROFILE="release"; CARGO_FLAGS="--release"
 
@@ -52,11 +56,12 @@ for arg in "$@"; do
     --ios)      BUILD_IOS=true; HAS_PLATFORM_FLAG=true ;;
     --sim)      BUILD_SIM=true; HAS_PLATFORM_FLAG=true ;;
     --mac)      BUILD_MAC=true; HAS_PLATFORM_FLAG=true ;;
+    --dist)     BUILD_MAC=true; BUILD_DIST=true; HAS_PLATFORM_FLAG=true ;;
     --bindings) BINDINGS_ONLY=true ;;
     --clean)    DO_CLEAN=true ;;
     --debug)    PROFILE="debug"; CARGO_FLAGS="" ;;
     -h|--help)
-      echo "Usage: $0 [--ios] [--sim] [--mac] [--bindings] [--clean] [--debug]"
+      echo "Usage: $0 [--ios] [--sim] [--mac] [--dist] [--bindings] [--clean] [--debug]"
       echo "  Platform flags are additive. No flag → iOS device + Simulator."
       exit 0 ;;
     *) warn "Unknown argument: $arg" ;;
@@ -157,7 +162,7 @@ build_target() {
   case "$arch" in
     aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios)
       deploy_env="IPHONEOS_DEPLOYMENT_TARGET=18.0" ;;
-    aarch64-apple-darwin) deploy_env="MACOSX_DEPLOYMENT_TARGET=15.0" ;;
+    aarch64-apple-darwin|x86_64-apple-darwin) deploy_env="MACOSX_DEPLOYMENT_TARGET=15.0" ;;
   esac
 
   local log="$TMP/cargo_${arch//\//_}.log"
@@ -182,6 +187,7 @@ if $BUILD_SIM; then
   build_target "x86_64-apple-ios"
 fi
 $BUILD_MAC && build_target "aarch64-apple-darwin"
+$BUILD_DIST && build_target "x86_64-apple-darwin"
 
 # ── Assemble slices ───────────────────────────────────────────────────────────
 # xcframework ships the static lib ONLY (no Headers) — exactly like
@@ -206,7 +212,15 @@ if $BUILD_SIM; then
 fi
 if $BUILD_MAC; then
   d="$TMP/slice_mac"; mkdir -p "$d"
-  cp "$TRANSPORT_ROOT/target/aarch64-apple-darwin/$PROFILE/$LIB.a" "$d/$LIB.a"
+  if $BUILD_DIST; then
+    # One macOS slice holding both: the app links whichever ARCHS it is archived for.
+    lipo -create \
+      "$TRANSPORT_ROOT/target/aarch64-apple-darwin/$PROFILE/$LIB.a" \
+      "$TRANSPORT_ROOT/target/x86_64-apple-darwin/$PROFILE/$LIB.a" \
+      -output "$d/$LIB.a"
+  else
+    cp "$TRANSPORT_ROOT/target/aarch64-apple-darwin/$PROFILE/$LIB.a" "$d/$LIB.a"
+  fi
   XCARGS+=(-library "$d/$LIB.a")
 fi
 [ "${#XCARGS[@]}" -gt 0 ] || fail "no slices to assemble — check platform flags."
