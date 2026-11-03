@@ -196,6 +196,10 @@ impl QuicChannel {
 /// live connection nor traffic. `alive_tasks` separates the two remaining shapes: one task that
 /// never yields, versus tasks that accumulate and are never reaped. Reading a stack is the next
 /// step either way, but this says which stack to go looking for.
+///
+/// `conns=` is the only FFI carrier of the live-connection count; the app's runtime health line
+/// (iOS `RuntimeDiagnostics`) prints this string. A separate `transport_live_connections` export
+/// carried the same number with no reader on any client and was removed on 2026-11-03.
 #[uniffi::export]
 pub fn transport_runtime_stats() -> String {
     // `udprecv_err` is the count of receive errors that terminated an endpoint poll instead of
@@ -226,16 +230,6 @@ pub fn transport_runtime_stats() -> String {
 /// as a number: `conns=0 tasks=1` while a worker thread sat at 100%.
 pub fn runtime_alive_tasks() -> usize {
     RT.metrics().num_alive_tasks()
-}
-
-/// How many QUIC connections this process holds open right now.
-///
-/// Belongs in every runtime health line on device. This number was unobservable while abandoned
-/// connections were accumulating, which is why "the transport burns a core" took a day to see
-/// and could not be attributed to anything.
-#[uniffi::export]
-pub fn transport_live_connections() -> u32 {
-    crate::client::live_connections()
 }
 
 /// One gRPC call. Send and receive halves are independently locked, so a Swift
