@@ -41,7 +41,7 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
 
 ## Rules
 
-1. **Prior art first.** Transport behaviour (handover, keepalive, congestion, retries) starts from what QUIC RFCs, quinn and h3 already do; a custom mechanism needs a note saying why they do not suffice.
+1. **Prior art first.** Transport behaviour (handover, keepalive, congestion, retries) starts from what QUIC RFCs, quinn and h3 already do; a custom mechanism needs a note saying why they do not suffice. Read them, do not recall them: the note links the code or spec it read, answers who may use theirs and what a refused party sees, lists what in ours is our own, why, and what would let us remove it, and gives the share of real traffic each new condition or exception affects. `~/Code/construct-docs/scripts/check_prior_art.py` refuses a decision note without the link.
 2. **Transport only.** Sessions, ratchets and message meaning stay in `construct-core`. This crate carries opaque bytes and reports connection facts; it never reads a payload.
 3. **Time is not an address.** A retry budget, cooldown or timer that papers over an unknown state means the state should be reported to the caller. Fix the report, not the timer.
 4. **Reproduce before fixing.** A transport bug gets a failing test in `tests/` (or a `probe` / `udpcheck` run on the real path) before the fix; the fix counts when it turns green.
