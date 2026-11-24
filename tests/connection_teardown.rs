@@ -25,6 +25,13 @@ use construct_transport::{client::QuicClient, client::live_connections, echo_ser
 /// the first run of `the_live_gauge_returns_to_its_starting_value` failed on exactly that.
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Await `fut`, failing under `what` if it never resolves.
+async fn within<T>(fut: impl std::future::Future<Output = T>, what: &str) -> T {
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .unwrap_or_else(|_| panic!("{what} never resolved"))
+}
+
 /// Boot an echo server and return (port, cert, server handle).
 async fn echo() -> Result<(u16, Vec<u8>, echo_server::ServerHandle)> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -43,7 +50,7 @@ async fn dropping_a_client_with_no_open_stream_closes_its_connection() -> Result
     let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
     // A clone of the quinn handle survives the drop, so we can ask the connection itself whether
     // it closed — asking the dropped client would prove nothing.
-    let observer = client.connection_handle();
+    let observer = client.connection_handle()?;
     assert!(
         observer.close_reason().is_none(),
         "connection should be healthy while the client is alive"
@@ -73,7 +80,7 @@ async fn dropping_a_client_while_a_stream_is_held_still_closes_its_connection() 
     let (port, cert, server) = echo().await?;
 
     let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
-    let observer = client.connection_handle();
+    let observer = client.connection_handle()?;
     let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
     assert_eq!(stream.recv_response().await?, 200);
 
@@ -101,7 +108,7 @@ async fn an_open_stream_does_not_keep_a_closed_client_alive() -> Result<()> {
     let (port, cert, server) = echo().await?;
 
     let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
-    let observer = client.connection_handle();
+    let observer = client.connection_handle()?;
     let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
     assert_eq!(stream.recv_response().await?, 200);
 
@@ -174,6 +181,117 @@ async fn an_explicitly_closed_connection_stops_counting_as_live() -> Result<()> 
         "and dropping the closed client must not subtract a second time"
     );
 
+    server.task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn closing_fails_a_parked_receive_rather_than_ending_the_stream() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    // `close()` drops the h3 `SendRequest`, and h3 marks the connection H3_NO_ERROR when the last
+    // one goes. If that ever reached a parked receive as end of stream, the app would read a
+    // retired channel as an RPC that completed.
+    let (port, cert, server) = echo().await?;
+
+    for i in 0..50 {
+        let client = QuicClient::connect("127.0.0.1", port, "localhost", cert.clone()).await?;
+        let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
+        assert_eq!(stream.recv_response().await?, 200);
+        // The echo server handles one stream per connection at a time, so this one waits.
+        let mut unanswered = client.open_stream("/construct.Echo/BiDi", &[]).await?;
+        let (_send, mut recv) = stream.split();
+        let parked = tokio::spawn(async move {
+            let got = recv.recv_message().await;
+            (recv, got)
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        client.close();
+
+        let (mut recv, got) = within(parked, "the parked receive").await?;
+        let text = format!(
+            "{:#}",
+            got.expect_err("expected an error, not end of stream")
+        );
+        // The marker iOS reads (`QuicRecvPumpDisposition`). Without it every ordinary close is
+        // logged as an ERROR. Many rounds because h3 and quinn race to report it.
+        assert!(text.contains("h3: closed"), "round {i}: {text}");
+        // And the same from a receive that starts after the close.
+        let late = within(recv.recv_message(), "recv.recv_message()")
+            .await
+            .expect_err("closed");
+        assert!(format!("{late:#}").contains("h3: closed"), "{late:#}");
+        let late = within(recv.recv_trailers(), "recv.recv_trailers()")
+            .await
+            .expect_err("closed");
+        assert!(format!("{late:#}").contains("h3: closed"), "{late:#}");
+        let late = within(unanswered.recv_response(), "unanswered.recv_response()")
+            .await
+            .expect_err("closed");
+        assert!(format!("{late:#}").contains("h3: closed"), "{late:#}");
+        let opened = client.open_stream("/construct.Echo/BiDi", &[]).await;
+        assert!(opened.is_err(), "a closed client must not open streams");
+        assert!(client.rebind().await.is_err(), "nor migrate");
+        let stats = client.stats_string();
+        assert!(
+            stats.contains("close=Some(LocallyClosed)"),
+            "the last snapshot must say how it ended: {stats}"
+        );
+    }
+
+    server.task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn closing_tells_the_peer_while_the_client_and_a_stream_are_held() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    // `close()` lets go of the endpoint right away. The CONNECTION_CLOSE must still leave: a peer
+    // that is not told keeps the connection until its idle timeout (30s).
+    let (port, cert, server) = echo().await?;
+
+    let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
+    let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
+    assert_eq!(stream.recv_response().await?, 200);
+    assert_eq!(server.endpoint.open_connections(), 1);
+
+    client.close();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.endpoint.open_connections() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the peer still holds the connection 5s after close()"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    drop(stream);
+    drop(client);
+    server.task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_peer_close_is_not_reported_as_ours() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    let (port, cert, server) = echo().await?;
+
+    let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
+    let mut stream = client.open_stream("/construct.Echo/BiDi", &[]).await?;
+    assert_eq!(stream.recv_response().await?, 200);
+
+    // H3_NO_ERROR, the code our own close arrives with.
+    server.endpoint.close(0x100u32.into(), b"going away");
+
+    let got = within(stream.recv_message(), "a receive after the peer closed").await;
+    let text = format!(
+        "{:#}",
+        got.expect_err("expected an error, not end of stream")
+    );
+    assert!(!text.contains("h3: closed"), "{text}");
+
+    drop(client);
     server.task.abort();
     Ok(())
 }
