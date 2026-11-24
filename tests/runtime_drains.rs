@@ -225,7 +225,7 @@ async fn a_refused_udp_port_does_not_leave_the_endpoint_spinning() -> Result<()>
     );
 
     // DOES NOT DISCRIMINATE, verified by mutation: stubbing `close_endpoint` out entirely leaves
-    // this green (only `dropping_a_client_stops_its_endpoint` goes red). The refused port produces
+    // this green. The refused port produces
     // the right kind of socket error, but the task still drains here — whatever keeps the driver
     // alive on device does not happen on loopback. Kept as a guard on the shape, not as evidence
     // that the spin is fixed. Only the device can settle that: `transport=conns=0 tasks=0`.
@@ -233,31 +233,88 @@ async fn a_refused_udp_port_does_not_leave_the_endpoint_spinning() -> Result<()>
 }
 
 #[tokio::test]
-async fn dropping_a_client_stops_its_endpoint() -> Result<()> {
+async fn closing_a_channel_stops_its_endpoint_while_the_handle_is_held() -> Result<()> {
     let _serialized = TEST_LOCK.lock().await;
-    // Direct statement of the fix. `Endpoint::close` makes further connects fail with
-    // EndpointStopping; a merely-dropped handle would still accept one, because quinn keeps the
-    // endpoint alive independently of who holds a handle to it.
+    // The iOS shape: `retire` calls `close()`, and other Swift references (the RPC that was using
+    // the channel, the stats task) outlive it. quinn's endpoint driver ends only when the last
+    // `Endpoint` handle is gone (quinn-0.11.9 `endpoint.rs`, `ref_count == 0`), so a close that
+    // keeps one leaves the driver polling for as long as anybody holds the channel.
+    let (port, cert, server) = echo().await?;
+
+    let baseline = runtime_alive_tasks();
+
+    let channel =
+        QuicChannel::connect("127.0.0.1".to_string(), port, "localhost".to_string(), cert)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let stream = channel
+        .open_stream("/construct.Echo/BiDi".to_string(), vec![])
+        .await
+        .map_err(|e| anyhow::anyhow!("open_stream: {e}"))?;
+    stream
+        .recv_response()
+        .await
+        .map_err(|e| anyhow::anyhow!("recv_response: {e}"))?;
+    assert!(
+        runtime_alive_tasks() > baseline,
+        "a live connection has tasks, or the assertion below measures nothing"
+    );
+
+    // From a plain thread, as Swift calls it: releasing the handles must not need a runtime.
+    let closer = channel.clone();
+    std::thread::spawn(move || closer.close())
+        .join()
+        .expect("close() panicked outside a runtime");
+
+    let alive = wait_for_tasks(baseline, Duration::from_secs(5)).await;
+    assert!(
+        alive <= baseline,
+        "{alive} task(s) alive after close() (baseline {baseline}) with the channel still held"
+    );
+
+    // Held until here on purpose: dropping them is what used to stop the endpoint.
+    drop(stream);
+    drop(channel);
+    server.task.abort();
+    Ok(())
+}
+
+/// Poll until `port` can be bound again, i.e. until the client's socket is really closed.
+async fn wait_for_port_release(port: u16, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn closing_a_client_releases_its_socket_while_the_client_is_held() -> Result<()> {
+    let _serialized = TEST_LOCK.lock().await;
+    // The other half, and not implied by the first: a `quinn::Connection` owns a reference to the
+    // socket too, so stopping the endpoint driver alone leaves the descriptor open.
     let (port, cert, server) = echo().await?;
 
     let client = QuicClient::connect("127.0.0.1", port, "localhost", cert).await?;
-    let endpoint = client.endpoint_handle();
+    let local = client.local_addr()?.port();
     assert!(
-        endpoint
-            .connect("127.0.0.1:1".parse()?, "localhost")
-            .is_ok(),
-        "endpoint should still be usable while the client is alive"
+        std::net::UdpSocket::bind(("0.0.0.0", local)).is_err(),
+        "the port must be taken while the client is live, or the assertion below measures nothing"
+    );
+
+    client.close();
+
+    assert!(
+        wait_for_port_release(local, Duration::from_secs(5)).await,
+        "the socket on port {local} is still open after close() with the client still held"
     );
 
     drop(client);
-
-    assert!(
-        endpoint
-            .connect("127.0.0.1:1".parse()?, "localhost")
-            .is_err(),
-        "the endpoint must be stopped, not merely unreferenced — its driver is what spun at 100%"
-    );
-
     server.task.abort();
     Ok(())
 }

@@ -8,11 +8,13 @@
 //! (used later by the FFI pump — not needed for the sequential API here).
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Buf, BytesMut};
+use h3::error::{Code, ConnectionError, LocalError, StreamError};
 use http::Request;
 use quinn::Endpoint;
 use rustls::pki_types::CertificateDer;
@@ -97,21 +99,37 @@ struct SocketRecipe {
     obf: Option<Salamander>,
 }
 
+/// Every handle whose existence keeps quinn's side of this connection running.
+///
+/// Grouped so that retirement can drop all of them at once. Two of the three matter separately:
+/// the endpoint driver task ends only when the last `Endpoint` is gone, and the socket stays open
+/// while any `quinn::Connection` is (`send_request` holds one as well).
+struct Live {
+    endpoint: Endpoint,
+    send_request: H3SendRequest,
+    conn: quinn::Connection,
+}
+
+enum State {
+    Live(Live),
+    /// Retired, by `close()` or by `Drop`. Holds no quinn handle, only the last snapshot, so the
+    /// diagnostic line still says how the connection ended.
+    Retired {
+        stats: String,
+    },
+}
+
 /// One QUIC/HTTP-3 connection to a gateway. Cheap to open streams from.
 ///
 /// Dropping this closes the connection — see the `Drop` impl. That is not the default
 /// behaviour of the parts it is built from, and the difference cost a day of device logs.
 pub struct QuicClient {
-    endpoint: Endpoint,
+    /// Never held across an await.
+    state: Mutex<State>,
     /// How to rebuild this endpoint's socket on a network handover. See `rebind`.
     socket_recipe: SocketRecipe,
-    send_request: H3SendRequest,
     authority: String,
-    conn: quinn::Connection,
     driver: tokio::task::JoinHandle<()>,
-    /// Set by the first retirement, whether that is `close()` or `Drop`. The two are the same
-    /// teardown reached from different directions, and the gauge must fall exactly once.
-    retired: AtomicBool,
 }
 
 impl Drop for QuicClient {
@@ -124,14 +142,15 @@ impl Drop for QuicClient {
     /// refuted it — emptying this whole body left `tests/connection_teardown.rs` green, held
     /// stream and all. Dropping the client already closed the connection.
     ///
-    /// 2026-08-10, the Time Profiler answered it: `Endpoint::close`. The endpoint driver, not the
-    /// connection, was spinning in `recvmsg`. See `close_endpoint` for the stack and the mechanism.
+    /// 2026-08-10, the Time Profiler answered it: the endpoint driver, not the connection, was
+    /// spinning in `recvmsg`. See `close_endpoint` for the stack and the mechanism.
     ///
     /// So each line earns its place differently, and none is decoration:
     ///   * `conn.close()` — states intent at the peer instead of relying on handle-drop order
     ///     inside two dependencies. Not load-bearing; kept deliberately.
     ///   * `driver.abort()` — a detached task is a real leak even when the connection closes.
-    ///   * `close_endpoint()` — **the fix.** Nothing else stops the endpoint driver.
+    ///   * releasing the handles — what ends the endpoint driver and frees the socket. Dropping
+    ///     the client does this anyway; `close()` has to do it explicitly, see `retire`.
     ///   * the gauge — what made the device diagnosable at all (`conns=0 tasks=1` is what ruled
     ///     out both accumulation theories and pointed at a single spinning task).
     fn drop(&mut self) {
@@ -347,9 +366,9 @@ impl QuicClient {
         server_name: &str,
         budget: Duration,
     ) -> Result<Self> {
-        // Every early return from here on must close the endpoint. A failed attempt leaves no
-        // connection behind, so nothing else will ever stop its driver — and a handshake failing
-        // is exactly the situation (blocked UDP) that makes that driver spin. See `close_endpoint`.
+        // `endpoint` is owned here, so every early return drops it, and that is what ends its
+        // driver — a handshake failing is exactly the situation (blocked UDP) that made that driver
+        // spin. The explicit close only ends what is still in flight. See `close_endpoint`.
         //
         // The address is in the error because "handshake timed out" without it cannot be told
         // from a resolver that handed us a different peer than the one H2 just reached. The
@@ -373,8 +392,7 @@ impl QuicClient {
 
         let conn_for_stats = conn.clone();
         // Same rule as the handshake error above: a failure here is an early return, and the
-        // next address in `dial` is about to bind another endpoint. Leaving this one running
-        // is the spin `close_endpoint` exists to stop.
+        // next address in `dial` is about to bind another endpoint.
         let (mut driver, send_request) =
             match h3::client::new(h3_quinn::Connection::new(conn)).await {
                 Ok(pair) => pair,
@@ -389,13 +407,14 @@ impl QuicClient {
 
         LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            endpoint,
+            state: Mutex::new(State::Live(Live {
+                endpoint,
+                send_request,
+                conn: conn_for_stats,
+            })),
             socket_recipe,
-            send_request,
             authority: server_name.to_string(),
-            conn: conn_for_stats,
             driver: driver_task,
-            retired: AtomicBool::new(false),
         })
     }
 
@@ -434,27 +453,30 @@ impl QuicClient {
     /// Polled rather than awaited because quinn exposes no "migration complete" future; the
     /// interval is short and the budget is one connect.
     pub async fn rebind(&self) -> Result<SocketAddr> {
-        let accepted_before = self.conn.stats().udp_rx.datagrams;
-
         let socket =
             obf_socket::client_socket(self.socket_recipe.bind, self.socket_recipe.obf.as_ref())
                 .context("bind replacement socket")?;
         let arrivals = socket.base.clone();
-        self.endpoint
-            .rebind_abstract(socket.endpoint_socket)
-            .context("rebind endpoint")?;
-        let local = self
-            .endpoint
-            .local_addr()
-            .context("local addr after rebind")?;
+        // Only the connection is cloned out: a `close()` during the wait shows as its close reason
+        // on the next poll, and the clone goes with it. An `Endpoint` clone would hold the driver.
+        let (conn, accepted_before, local) = self.with_live(|live| {
+            let accepted_before = live.conn.stats().udp_rx.datagrams;
+            live.endpoint
+                .rebind_abstract(socket.endpoint_socket)
+                .context("rebind endpoint")?;
+            let local = live
+                .endpoint
+                .local_addr()
+                .context("local addr after rebind")?;
+            Ok((live.conn.clone(), accepted_before, local))
+        })?;
 
         let deadline = tokio::time::Instant::now() + MIGRATION_PROOF_BUDGET;
         loop {
-            if let Some(reason) = self.conn.close_reason() {
+            if let Some(reason) = conn.close_reason() {
                 return Err(anyhow!("connection died during migration: {reason}"));
             }
-            if arrivals.received_datagrams() > 0
-                && self.conn.stats().udp_rx.datagrams > accepted_before
+            if arrivals.received_datagrams() > 0 && conn.stats().udp_rx.datagrams > accepted_before
             {
                 return Ok(local);
             }
@@ -468,16 +490,30 @@ impl QuicClient {
         }
     }
 
-    /// A clone of the endpoint handle, for asserting after this client is gone that its driver
-    /// was actually stopped. Test/diagnostic use — `Endpoint` is a handle, not the driver.
-    pub fn endpoint_handle(&self) -> Endpoint {
-        self.endpoint.clone()
+    /// The local address of this connection's socket. Test/diagnostic use.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.with_live(|live| live.endpoint.local_addr().context("local addr"))
     }
 
     /// A clone of the quinn connection handle, for observing state (`close_reason`) after this
-    /// client is gone. Test/diagnostic use — it does not keep the connection open on its own.
-    pub fn connection_handle(&self) -> quinn::Connection {
-        self.conn.clone()
+    /// client is gone. Test/diagnostic use — it does not keep the connection open on its own, but
+    /// it does keep the socket's descriptor open for as long as it is held.
+    pub fn connection_handle(&self) -> Result<quinn::Connection> {
+        self.with_live(|live| Ok(live.conn.clone()))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // Nothing under this lock leaves the state half-written, so a panic elsewhere must not
+        // turn `close()` into a second one.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run `f` on the live handles, or report the connection closed.
+    fn with_live<T>(&self, f: impl FnOnce(&Live) -> Result<T>) -> Result<T> {
+        match &*self.lock() {
+            State::Live(live) => f(live),
+            State::Retired { .. } => Err(anyhow!("connection closed")),
+        }
     }
 
     /// Close the connection now, without waiting for every reference to go away.
@@ -491,25 +527,41 @@ impl QuicClient {
 
     /// The one teardown, reached from `close()` and from `Drop`.
     ///
-    /// Each line is explained in the `Drop` doc comment above — only the gauge is new here, and
-    /// only its placement: it must fall on the first retirement, not on the last reference, and
-    /// it must fall once. `swap` is what makes "once" true without a lock; a second retirement is
-    /// otherwise entirely legal and happens on every explicit close (the `Arc` still drops later).
+    /// Closing is not enough; the handles have to go too. quinn ends the endpoint driver when the
+    /// last `Endpoint` is dropped (`ref_count == 0` in quinn-0.11.9 `endpoint.rs`) and closes the
+    /// socket when the last `quinn::Connection` is. Until 2026-11-24 this client kept both until
+    /// its own drop, so a closed channel that Swift still referenced went on owning a polled
+    /// socket while the gauge read `conns=0`. The peer is still told: quinn's connection task
+    /// sends CONNECTION_CLOSE and drains on its own, without our handles.
+    ///
+    /// What a held stream still keeps is the descriptor, not the driver.
+    ///
+    /// The first retirement does all of it, including the gauge; a second is legal (the `Arc`
+    /// drops after every explicit close) and finds nothing left to do.
     fn retire(&self, reason: &[u8]) {
-        self.conn.close(0u32.into(), reason);
+        let mut state = self.lock();
+        let State::Live(live) = &*state else {
+            return;
+        };
+        live.conn.close(0u32.into(), reason);
         self.driver.abort();
-        // Shut the endpoint down, not just the connection. This is the 2026-08-10 heat fix —
-        // see `close_endpoint` for why dropping the handle is not enough.
-        Self::close_endpoint(&self.endpoint);
-        if !self.retired.swap(true, Ordering::Relaxed) {
-            LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-        }
+        Self::close_endpoint(&live.endpoint);
+        let stats = Self::format_stats(&live.conn);
+        let released = std::mem::replace(&mut *state, State::Retired { stats });
+        drop(state);
+        drop(released);
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Stop quinn's endpoint driver.
+    /// Refuse new connections on this endpoint and close the ones it has.
     ///
-    /// THE HEAT FIX (device, Time Profiler, 2026-08-10). One tokio worker at 90% of a 1.5-minute
-    /// trace, all of it here:
+    /// **This does not stop the endpoint driver** — dropping the last `Endpoint` does, once its
+    /// connections have drained. The note here said the opposite until 2026-11-24, when twenty
+    /// closed channels were measured to keep twenty drivers and twenty sockets (todo/342). On the
+    /// failed-handshake paths the endpoint is a local that drops on the same return.
+    ///
+    /// Why a driver left running matters — THE HEAT (device, Time Profiler, 2026-08-10). One tokio
+    /// worker at 90% of a 1.5-minute trace, all of it here:
     ///
     /// ```text
     ///   quinn::endpoint::EndpointDriver::poll            86.5%
@@ -530,27 +582,31 @@ impl QuicClient {
     /// This is also why it never reproduced locally: `tests/runtime_drains.rs` blackholes the
     /// handshake through TEST-NET-3, which drops packets *silently*. No ICMP, no socket error, no
     /// spin. The harness could only ever have staged the healthy case.
-    ///
-    /// Dropping the `Endpoint` handle does not stop the driver — quinn keeps it alive while any
-    /// connection exists, and on the failed-handshake path there is no connection to close at
-    /// all. `Endpoint::close` is the thing that ends it.
     fn close_endpoint(endpoint: &Endpoint) {
         endpoint.close(0u32.into(), b"endpoint retired");
     }
 
     /// Diagnostic snapshot of the live quinn connection. `ping` is the count of
     /// keep-alive PING frames sent — if it does not grow over time, keep-alive is not
-    /// firing. `close` is the connection's close reason (None while healthy).
+    /// firing. `close` is the connection's close reason (None while healthy). After retirement
+    /// this is the snapshot taken then.
     pub fn stats_string(&self) -> String {
-        let s = self.conn.stats();
+        match &*self.lock() {
+            State::Live(live) => Self::format_stats(&live.conn),
+            State::Retired { stats } => stats.clone(),
+        }
+    }
+
+    fn format_stats(conn: &quinn::Connection) -> String {
+        let s = conn.stats();
         format!(
             "tx_pkts={} rx_pkts={} ping_tx={} rtt={}ms lost={} close={:?}",
             s.udp_tx.datagrams,
             s.udp_rx.datagrams,
             s.frame_tx.ping,
-            self.conn.rtt().as_millis(),
+            conn.rtt().as_millis(),
             s.path.lost_packets,
-            self.conn.close_reason(),
+            conn.close_reason(),
         )
     }
 
@@ -571,7 +627,7 @@ impl QuicClient {
         }
         let req = builder.body(()).context("build request")?;
 
-        let mut send_request = self.send_request.clone();
+        let mut send_request = self.with_live(|live| Ok(live.send_request.clone()))?;
         let inner = send_request
             .send_request(req)
             .await
@@ -580,6 +636,33 @@ impl QuicClient {
             inner,
             recv_buf: BytesMut::new(),
         })
+    }
+}
+
+/// A receive error, with our own close named as such.
+///
+/// The app logs a receive that ends because this process closed the connection as routine, and
+/// tells it apart by `h3: closed` in the text (iOS `QuicRecvPumpDisposition`). That wording used to
+/// arrive by accident, as quinn's `LocallyClosed` printed through h3. `retire` also drops the last
+/// h3 `SendRequest`, so h3 now reports its own H3_NO_ERROR whenever it gets there before quinn's
+/// error does; both have to read the same. The peer closing with H3_NO_ERROR is not this, which is
+/// why `is_h3_no_error()` is not the test.
+fn recv_error(what: &'static str, error: StreamError) -> anyhow::Error {
+    match error {
+        // Braces, not a tuple pattern: the variant is `#[non_exhaustive]` in h3.
+        StreamError::ConnectionError {
+            0:
+                ConnectionError::Local {
+                    error:
+                        LocalError::Application {
+                            code: Code::H3_NO_ERROR,
+                            ..
+                        },
+                    ..
+                },
+            ..
+        } => anyhow!("{what}: closed by this client (h3: closed)"),
+        other => anyhow::Error::new(other).context(what),
     }
 }
 
@@ -592,7 +675,11 @@ pub struct QuicStream {
 impl QuicStream {
     /// Await the response headers; returns the HTTP status code.
     pub async fn recv_response(&mut self) -> Result<u16> {
-        let resp = self.inner.recv_response().await.context("recv_response")?;
+        let resp = self
+            .inner
+            .recv_response()
+            .await
+            .map_err(|e| recv_error("recv_response", e))?;
         Ok(resp.status().as_u16())
     }
 
@@ -610,7 +697,12 @@ impl QuicStream {
             if let Some(frame) = grpc::take_frame(&mut self.recv_buf) {
                 return Ok(Some(frame.to_vec()));
             }
-            match self.inner.recv_data().await.context("recv_data")? {
+            match self
+                .inner
+                .recv_data()
+                .await
+                .map_err(|e| recv_error("recv_data", e))?
+            {
                 Some(mut chunk) => {
                     let bytes = chunk.copy_to_bytes(chunk.remaining());
                     self.recv_buf.extend_from_slice(&bytes);
@@ -627,7 +719,11 @@ impl QuicStream {
 
     /// Read trailing metadata (e.g. `grpc-status`) after the stream ends.
     pub async fn recv_trailers(&mut self) -> Result<Vec<(String, String)>> {
-        let trailers = self.inner.recv_trailers().await.context("recv_trailers")?;
+        let trailers = self
+            .inner
+            .recv_trailers()
+            .await
+            .map_err(|e| recv_error("recv_trailers", e))?;
         Ok(trailers
             .map(|headers| {
                 headers
@@ -686,7 +782,11 @@ pub struct QuicRecvStream {
 impl QuicRecvStream {
     /// Await the response headers; returns the HTTP status code.
     pub async fn recv_response(&mut self) -> Result<u16> {
-        let resp = self.inner.recv_response().await.context("recv_response")?;
+        let resp = self
+            .inner
+            .recv_response()
+            .await
+            .map_err(|e| recv_error("recv_response", e))?;
         Ok(resp.status().as_u16())
     }
 
@@ -696,7 +796,12 @@ impl QuicRecvStream {
             if let Some(frame) = grpc::take_frame(&mut self.recv_buf) {
                 return Ok(Some(frame.to_vec()));
             }
-            match self.inner.recv_data().await.context("recv_data")? {
+            match self
+                .inner
+                .recv_data()
+                .await
+                .map_err(|e| recv_error("recv_data", e))?
+            {
                 Some(mut chunk) => {
                     let bytes = chunk.copy_to_bytes(chunk.remaining());
                     self.recv_buf.extend_from_slice(&bytes);
@@ -708,7 +813,11 @@ impl QuicRecvStream {
 
     /// Read trailing metadata (e.g. `grpc-status`) after the stream ends.
     pub async fn recv_trailers(&mut self) -> Result<Vec<(String, String)>> {
-        let trailers = self.inner.recv_trailers().await.context("recv_trailers")?;
+        let trailers = self
+            .inner
+            .recv_trailers()
+            .await
+            .map_err(|e| recv_error("recv_trailers", e))?;
         Ok(trailers
             .map(|headers| {
                 headers

@@ -45,7 +45,7 @@ async fn a_live_stream_survives_the_socket_being_replaced() -> Result<()> {
         b"before-handover"
     );
 
-    let before = client.endpoint_handle().local_addr()?;
+    let before = client.local_addr()?;
     let after = tokio::time::timeout(Duration::from_secs(5), client.rebind())
         .await
         .expect("rebind hung")?;

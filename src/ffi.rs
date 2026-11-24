@@ -69,7 +69,7 @@ fn err(e: anyhow::Error) -> TransportError {
 /// several fixes. Bump on changes that need on-device verification.
 #[uniffi::export]
 pub fn transport_build_marker() -> String {
-    "quic-plain-relaxed-keepalive-2026-06-24".to_string()
+    "quic-close-releases-endpoint-2026-11-24".to_string()
 }
 
 /// A request/response header pair (e.g. `authorization`, `grpc-status`).
@@ -159,6 +159,10 @@ impl QuicChannel {
     /// `QuicClient::drop`), but it is not something this crate states or can hold a dependency
     /// to. This makes retirement explicit.
     pub fn close(&self) {
+        // The endpoint's task ends and the channel lets go of its socket, however long this object
+        // stays referenced; later calls fail with "connection closed". Not in the doc comment
+        // above: UniFFI hashes that into the binding checksum, and the app would have to
+        // regenerate for a sentence.
         self.inner.close();
     }
 
