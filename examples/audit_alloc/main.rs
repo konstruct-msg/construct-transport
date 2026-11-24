@@ -91,7 +91,7 @@ fn micro() {
         let enc = end(l, 1);
         let mut rb = BytesMut::from(&f[..]);
         let l = begin();
-        let v = grpc::take_frame(&mut rb).unwrap().to_vec();
+        let v = grpc::take_frame(&mut rb).unwrap().unwrap().to_vec();
         let take = end(l, 1);
         let some: Option<Vec<u8>> = Some(v);
         let l = begin();
@@ -244,7 +244,7 @@ async fn retain(peer: &Peer) -> Result<()> {
 }
 
 async fn lie(peer: &Peer) -> Result<()> {
-    println!("## a peer that declares a huge message (length prefix is never bounded)");
+    println!("## a peer that declares a huge message (the limit is 4 MiB)");
     let c = QuicClient::connect("127.0.0.1", peer.port, "localhost", peer.cert.clone()).await?;
     for mib in [16usize, 64, 256] {
         let (_tx, mut rx) = c
@@ -257,10 +257,10 @@ async fn lie(peer: &Peer) -> Result<()> {
         let k = end(l, 1);
         println!(
             "peer sent {mib} MiB of a 4 GiB message: result={} held {} MiB, peak {} MiB",
-            if r.is_err() {
-                "still waiting"
-            } else {
-                "returned"
+            match r {
+                Err(_) => "still waiting".to_string(),
+                Ok(Err(e)) => format!("refused ({e:#})"),
+                Ok(Ok(_)) => "returned".to_string(),
             },
             k.kept >> 20,
             k.peak >> 20

@@ -58,7 +58,7 @@ async fn bidi_grpc_over_h3_roundtrips() -> Result<()> {
         stream.send_data(grpc::encode_frame(&payload)).await?;
 
         let echoed = loop {
-            if let Some(frame) = grpc::take_frame(&mut buf) {
+            if let Some(frame) = grpc::take_frame(&mut buf)? {
                 break frame;
             }
             match tokio::time::timeout(Duration::from_secs(5), stream.recv_data())
