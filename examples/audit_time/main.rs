@@ -141,14 +141,12 @@ async fn bulk() -> Result<()> {
             got += 1;
         }
         assert_eq!(got, n);
-        let d = ours.connection_handle().stats();
         println!(
-            "round {round} SpinFree socket: cpu {:>7} us  wall {:>6} ms  instr {:>5} M  datagrams rx {} tx {}",
+            "round {round} SpinFree socket: cpu {:>7} us  wall {:>6} ms  instr {:>5} M  {}",
             me().cpu_us - u.cpu_us,
             t.elapsed().as_millis(),
             (me().instructions - u.instructions) / 1_000_000,
-            d.udp_rx.datagrams,
-            d.udp_tx.datagrams
+            ours.stats_string()
         );
         ours.close();
 
