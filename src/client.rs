@@ -666,6 +666,37 @@ fn recv_error(what: &'static str, error: StreamError) -> anyhow::Error {
     }
 }
 
+/// The next complete gRPC message, or `None` at end of stream.
+///
+/// A message over the limit fails the call and reads nothing more; flow control stops the peer, and
+/// the stream is stopped when the caller drops it, as after any other receive error. It is not
+/// stopped here: h3 may return buffered data while its next read is still pending, and
+/// `stop_sending` then panics (h3-quinn 0.0.10 unwraps a stream the read has taken).
+async fn recv_message<S, B>(
+    stream: &mut h3::client::RequestStream<S, B>,
+    recv_buf: &mut BytesMut,
+) -> Result<Option<Vec<u8>>>
+where
+    S: h3::quic::RecvStream,
+{
+    loop {
+        if let Some(frame) = grpc::take_frame(recv_buf).context("recv_message")? {
+            return Ok(Some(Vec::from(frame)));
+        }
+        match stream
+            .recv_data()
+            .await
+            .map_err(|e| recv_error("recv_data", e))?
+        {
+            Some(mut chunk) => {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                recv_buf.extend_from_slice(&bytes);
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
 /// One gRPC call over HTTP/3. Messages are length-prefix framed on the wire.
 pub struct QuicStream {
     inner: H3RequestStream,
@@ -693,23 +724,7 @@ impl QuicStream {
 
     /// Receive the next complete gRPC message, or `None` at end of stream.
     pub async fn recv_message(&mut self) -> Result<Option<Vec<u8>>> {
-        loop {
-            if let Some(frame) = grpc::take_frame(&mut self.recv_buf) {
-                return Ok(Some(frame.to_vec()));
-            }
-            match self
-                .inner
-                .recv_data()
-                .await
-                .map_err(|e| recv_error("recv_data", e))?
-            {
-                Some(mut chunk) => {
-                    let bytes = chunk.copy_to_bytes(chunk.remaining());
-                    self.recv_buf.extend_from_slice(&bytes);
-                }
-                None => return Ok(None),
-            }
-        }
+        recv_message(&mut self.inner, &mut self.recv_buf).await
     }
 
     /// Half-close the client send side (after the last outbound message).
@@ -792,23 +807,7 @@ impl QuicRecvStream {
 
     /// Receive the next complete gRPC message, or `None` at end of stream.
     pub async fn recv_message(&mut self) -> Result<Option<Vec<u8>>> {
-        loop {
-            if let Some(frame) = grpc::take_frame(&mut self.recv_buf) {
-                return Ok(Some(frame.to_vec()));
-            }
-            match self
-                .inner
-                .recv_data()
-                .await
-                .map_err(|e| recv_error("recv_data", e))?
-            {
-                Some(mut chunk) => {
-                    let bytes = chunk.copy_to_bytes(chunk.remaining());
-                    self.recv_buf.extend_from_slice(&bytes);
-                }
-                None => return Ok(None),
-            }
-        }
+        recv_message(&mut self.inner, &mut self.recv_buf).await
     }
 
     /// Read trailing metadata (e.g. `grpc-status`) after the stream ends.

@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         let payload = format!("probe-{i}").into_bytes();
         stream.send_data(grpc::encode_frame(&payload)).await?;
         let echoed = loop {
-            if let Some(frame) = grpc::take_frame(&mut buf) {
+            if let Some(frame) = grpc::take_frame(&mut buf)? {
                 break frame;
             }
             match tokio::time::timeout(Duration::from_secs(10), stream.recv_data())

@@ -65,7 +65,7 @@ async fn idle_connection_survives_via_keep_alive() -> Result<()> {
     ) -> Result<()> {
         stream.send_data(grpc::encode_frame(payload)).await?;
         loop {
-            if let Some(frame) = grpc::take_frame(buf) {
+            if let Some(frame) = grpc::take_frame(buf)? {
                 assert_eq!(&frame[..], payload, "echo mismatch");
                 return Ok(());
             }
@@ -144,7 +144,7 @@ async fn server_only_keep_alive_with_idle_client() -> Result<()> {
     let mut buf = BytesMut::new();
     stream.send_data(grpc::encode_frame(b"before-idle")).await?;
     loop {
-        if grpc::take_frame(&mut buf).is_some() {
+        if grpc::take_frame(&mut buf)?.is_some() {
             break;
         }
         match tokio::time::timeout(Duration::from_secs(5), stream.recv_data())
@@ -161,7 +161,7 @@ async fn server_only_keep_alive_with_idle_client() -> Result<()> {
     // Try a round-trip after idle. Returns Ok(true) if the connection survived.
     stream.send_data(grpc::encode_frame(b"after-idle")).await?;
     let survived = loop {
-        if grpc::take_frame(&mut buf).is_some() {
+        if grpc::take_frame(&mut buf)?.is_some() {
             break true;
         }
         match tokio::time::timeout(Duration::from_secs(3), stream.recv_data()).await {

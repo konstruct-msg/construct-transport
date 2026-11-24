@@ -56,7 +56,7 @@ fn micro() {
             n,
             || {
                 let mut b = BytesMut::from(&frame[..]);
-                black_box(grpc::take_frame(&mut b).unwrap().to_vec());
+                black_box(grpc::take_frame(&mut b).unwrap().unwrap().to_vec());
             },
         );
         bench(
@@ -171,7 +171,7 @@ async fn bulk() -> Result<()> {
             use bytes::Buf;
             let b: Bytes = c.copy_to_bytes(c.remaining());
             rb.extend_from_slice(&b);
-            while let Some(f) = grpc::take_frame(&mut rb) {
+            while let Some(f) = grpc::take_frame(&mut rb)? {
                 black_box(f.to_vec());
                 got += 1;
             }
