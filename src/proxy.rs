@@ -12,6 +12,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes};
@@ -25,11 +26,48 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
+use crate::h3_guard;
 use crate::obf_socket;
 use crate::salamander::Salamander;
 
 /// Concrete h3 server stream over a quinn bidi stream.
-type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type H3Stream = h3::server::RequestStream<h3_guard::BidiStream, Bytes>;
+
+/// What the gateway takes on, across all peers. What one connection may hold is in
+/// [`tls::server_config`](crate::tls::server_config) and [`h3_guard`].
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Connections open at once; the next one is refused (`CONNECTION_REFUSED`), so the client
+    /// learns it in one round trip and takes its H2 path instead of waiting for a timeout.
+    ///
+    /// Measured 2026-11-23/24 (construct-docs todo 332): never more than two at once. 256 is there
+    /// to bound memory, not to shape traffic.
+    pub max_connections: usize,
+    /// Above this many, a peer must show it receives at its address (Retry, RFC 9000 §8.1.2)
+    /// before any state is kept for it, so that forged addresses cannot fill the table. Costs the
+    /// newcomer one round trip; below it, nothing changes.
+    pub validate_above: usize,
+    /// How long an upstream call outlives the client's connection: time for what the client
+    /// already sent to go up. The answer has nobody to go to.
+    pub orphan_grace: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: 256,
+            validate_above: 128,
+            orphan_grace: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Refusals are counted and reported on one line per window: a line each would turn a flood into
+/// a full disk.
+const REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// Bytes of one call the gateway holds on the upstream side, each way.
+const UPSTREAM_WINDOW: u32 = 64 * 1024;
 
 /// A running proxy: bound address, the endpoint, and the accept task.
 pub struct ProxyHandle {
@@ -45,7 +83,17 @@ pub async fn serve(
     bind: SocketAddr,
     upstream: String,
 ) -> Result<ProxyHandle> {
-    serve_on_endpoint(Endpoint::server(server_config, bind)?, upstream)
+    serve_with_limits(server_config, bind, upstream, Limits::default()).await
+}
+
+/// [`serve`] with limits other than the default ones (tests).
+pub async fn serve_with_limits(
+    server_config: quinn::ServerConfig,
+    bind: SocketAddr,
+    upstream: String,
+    limits: Limits,
+) -> Result<ProxyHandle> {
+    serve_on_endpoint(Endpoint::server(server_config, bind)?, upstream, limits)
 }
 
 /// Like [`serve`] but Salamander-obfuscates every datagram with `psk` (the DPI-evading
@@ -61,19 +109,61 @@ pub async fn serve_obfuscated(
     let server_config = crate::tls::server_config_obf(bundle)?;
     let endpoint =
         obf_socket::obfuscated_server_endpoint(bind, Salamander::new(psk), server_config)?;
-    serve_on_endpoint(endpoint, upstream)
+    serve_on_endpoint(endpoint, upstream, Limits::default())
 }
 
 /// Run the accept-loop on a pre-built endpoint — shared by the plain and obfuscated paths
 /// (only the underlying UDP socket / MTU differs).
-fn serve_on_endpoint(endpoint: Endpoint, upstream: String) -> Result<ProxyHandle> {
+fn serve_on_endpoint(endpoint: Endpoint, upstream: String, limits: Limits) -> Result<ProxyHandle> {
     let addr = endpoint.local_addr()?;
     let accept_ep = endpoint.clone();
     let task = tokio::spawn(async move {
-        while let Some(incoming) = accept_ep.accept().await {
+        let mut refused = 0u64;
+        let mut report = tokio::time::interval(REPORT_EVERY);
+        loop {
+            let incoming = tokio::select! {
+                incoming = accept_ep.accept() => match incoming {
+                    Some(incoming) => incoming,
+                    None => break,
+                },
+                _ = report.tick() => {
+                    if refused > 0 {
+                        warn!(
+                            refused,
+                            open = accept_ep.open_connections(),
+                            max = limits.max_connections,
+                            "gateway full: connections refused in the last minute"
+                        );
+                        refused = 0;
+                    }
+                    continue;
+                }
+            };
+            // Capacity first, then address validation: the order of quinn's own server example
+            // (`quinn/examples/server.rs`).
+            let open = accept_ep.open_connections();
+            if open >= limits.max_connections {
+                incoming.refuse();
+                refused += 1;
+                continue;
+            }
+            if open >= limits.validate_above && !incoming.remote_address_validated() {
+                // Cannot fail: an address that is not validated may always be asked to retry.
+                let _ = incoming.retry();
+                continue;
+            }
+            // Accepted here and not in the task: this is what makes it count as open before the
+            // next one is looked at.
+            let connecting = match incoming.accept() {
+                Ok(connecting) => connecting,
+                Err(e) => {
+                    debug!("accept: {e}");
+                    continue;
+                }
+            };
             let upstream = upstream.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(incoming, upstream).await {
+                if let Err(e) = handle_conn(connecting, upstream, limits.orphan_grace).await {
                     warn!("connection ended: {e:#}");
                 }
             });
@@ -86,14 +176,22 @@ fn serve_on_endpoint(endpoint: Endpoint, upstream: String) -> Result<ProxyHandle
     })
 }
 
-async fn handle_conn(incoming: quinn::Incoming, upstream: String) -> Result<()> {
-    let conn = incoming.await?;
+async fn handle_conn(
+    connecting: quinn::Connecting,
+    upstream: String,
+    orphan_grace: Duration,
+) -> Result<()> {
+    let conn = connecting.await?;
     debug!(rtt = ?conn.rtt(), "QUIC connection accepted");
-    let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
+    let mut h3 = h3::server::builder()
+        .max_field_section_size(h3_guard::MAX_BUFFERED_FRAME)
+        .build(h3_guard::Connection::new(conn.clone()))
+        .await?;
 
     // Each H3 request is an independent gRPC call → proxy concurrently.
     while let Some(resolver) = h3.accept().await? {
         let upstream = upstream.clone();
+        let conn = conn.clone();
         tokio::spawn(async move {
             let (req, stream) = match resolver.resolve_request().await {
                 Ok(v) => v,
@@ -102,8 +200,17 @@ async fn handle_conn(incoming: quinn::Incoming, upstream: String) -> Result<()> 
                     return;
                 }
             };
-            if let Err(e) = proxy_request(req, stream, &upstream).await {
-                warn!("proxy request failed: {e:#}");
+            let orphaned = async {
+                conn.closed().await;
+                tokio::time::sleep(orphan_grace).await;
+            };
+            tokio::select! {
+                ended = proxy_request(req, stream, &upstream) => {
+                    if let Err(e) = ended {
+                        warn!("proxy request failed: {e:#}");
+                    }
+                }
+                () = orphaned => debug!("upstream call dropped: the client is gone"),
             }
         });
     }
@@ -124,7 +231,13 @@ async fn proxy_request(req: Request<()>, stream: H3Stream, upstream: &str) -> Re
         .with_context(|| format!("dial upstream {upstream}"))?;
     tcp.set_nodelay(true).ok();
     let io = TokioIo::new(tcp);
-    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+    // One call per h2 connection, over loopback: windows larger than the protocol's default buy no
+    // speed here, they only are what a client that does not read can make the gateway hold
+    // (hyper's defaults: 2 MiB per stream, 1 MiB of send buffer).
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .initial_stream_window_size(UPSTREAM_WINDOW)
+        .max_send_buf_size(UPSTREAM_WINDOW as usize)
+        .handshake(io)
         .await
         .context("upstream h2 handshake")?;
     tokio::spawn(async move {
