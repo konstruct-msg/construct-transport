@@ -429,6 +429,105 @@ async fn gateway() -> Result<()> {
             kids(&format!("  clients closed, +{w}s"), &g, &up, &u0, &v0);
         }
     }
+
+    println!("## gateway: client that never reads, upstream pushes 256 MiB");
+    for n in [1usize, 5] {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let (u0, v0) = (usage(g.pid()), usage(up.pid()));
+        let mut cs = vec![];
+        for _ in 0..n {
+            let c = mk().await?;
+            let (tx, mut rx) = c.open_stream("/push/4096/65536", &[]).await?.split();
+            rx.recv_response().await?;
+            cs.push((c, tx, rx));
+        }
+        for w in [2u64, 5] {
+            tokio::time::sleep(Duration::from_secs(w)).await;
+            kids(&format!("{n} stalled client(s), +{w}s"), &g, &up, &u0, &v0);
+        }
+        for (c, ..) in &cs {
+            c.close();
+        }
+    }
+    println!("## gateway: one client, 100 streams never read, upstream pushes 256 MiB each");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let (u0, v0) = (usage(g.pid()), usage(up.pid()));
+    let c = mk().await?;
+    let mut ss = vec![];
+    for _ in 0..100 {
+        let (tx, mut rx) = c.open_stream("/push/4096/65536", &[]).await?.split();
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv_response()).await;
+        ss.push((tx, rx));
+    }
+    for w in [2u64, 5] {
+        tokio::time::sleep(Duration::from_secs(w)).await;
+        kids(&format!("  +{w}s"), &g, &up, &u0, &v0);
+    }
+    c.close();
+    drop(ss);
+
+    println!("## gateway: 1 GiB read as fast as it comes, one stream");
+    for _ in 0..3 {
+        let c = mk().await?;
+        let (_tx, mut rx) = c.open_stream("/push/16384/65536", &[]).await?.split();
+        rx.recv_response().await?;
+        let (u, t) = (usage(g.pid()), Instant::now());
+        let mut got = 0usize;
+        while let Some(m) = rx.recv_message().await? {
+            got += m.len();
+        }
+        println!(
+            "{:.0} MB/s, gateway cpu {} ms",
+            got as f64 / 1e6 / t.elapsed().as_secs_f64(),
+            (usage(g.pid()).cpu_us - u.cpu_us) / 1000
+        );
+        c.close();
+    }
+
+    println!("## gateway: connections that do nothing");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let (u0, v0) = (usage(g.pid()), usage(up.pid()));
+    let mut cs = vec![];
+    let mut refused = 0;
+    for _ in 0..400 {
+        match mk().await {
+            Ok(c) => cs.push(c),
+            Err(_) => refused += 1,
+        }
+    }
+    println!("400 asked: {} in, {refused} refused", cs.len());
+    kids("  ", &g, &up, &u0, &v0);
+    for c in &cs {
+        c.close();
+    }
+
+    println!("## gateway: one stream, no call, a HEADERS frame of 1 GiB of which 256 MiB is sent");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let (u0, v0) = (usage(g.pid()), usage(up.pid()));
+    let trust = tls::CertBundle {
+        cert: g.cert.clone().into(),
+        key_der: vec![],
+    };
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+    ep.set_default_client_config(tls::client_config(&trust)?);
+    let conn = ep
+        .connect(([127, 0, 0, 1], g.port).into(), "localhost")?
+        .await?;
+    let (mut tx, _rx) = conn.open_bi().await?;
+    tx.write_all(&[0x01, 0xc0, 0, 0, 0, 0x40, 0, 0, 0]).await?;
+    let chunk = vec![0u8; 64 * 1024];
+    let mut sent = 0;
+    while sent < 256 * 1024 * 1024 {
+        match tx.write(&chunk).await {
+            Ok(n) => sent += n,
+            Err(e) => {
+                println!("refused after {} KiB: {e}", sent / 1024);
+                break;
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    kids("  ", &g, &up, &u0, &v0);
     Ok(())
 }
 

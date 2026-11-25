@@ -88,22 +88,47 @@ pub fn build_transport_config(
     keep_alive: Duration,
     max_idle: Duration,
 ) -> Result<Arc<quinn::TransportConfig>> {
+    Ok(Arc::new(tuned(keep_alive, max_idle)?))
+}
+
+fn tuned(keep_alive: Duration, max_idle: Duration) -> Result<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     tc.keep_alive_interval(Some(keep_alive));
     tc.max_idle_timeout(Some(max_idle.try_into()?));
-    Ok(Arc::new(tc))
+    Ok(tc)
 }
 
-fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
-    build_transport_config(
+fn transport_config() -> Result<quinn::TransportConfig> {
+    tuned(
         Duration::from_secs(QUIC_KEEP_ALIVE_SECS),
         Duration::from_secs(QUIC_MAX_IDLE_SECS),
     )
 }
 
+/// Bytes one connection may make the server hold, each way. quinn's defaults leave the receiving
+/// side open (100 streams of 1.25 MB, `receive_window` unlimited) and allow 10 MB of unacknowledged
+/// sending. 1 MiB is 10 MB/s at 100 ms.
+const SERVER_CONNECTION_WINDOW: u32 = 1024 * 1024;
+
+/// Bytes one stream may have unread, a quarter of the connection's. Were they equal, one call whose
+/// upstream does not read would take the whole connection window, and the next call could not even
+/// deliver its headers (RFC 9000 §4.1).
+const SERVER_STREAM_WINDOW: u32 = SERVER_CONNECTION_WINDOW / 4;
+
+/// Bound what one peer can make a server keep. Server side only: a client chose whom it talks to.
+fn bound_for_server(tc: &mut quinn::TransportConfig) {
+    tc.receive_window(SERVER_CONNECTION_WINDOW.into());
+    tc.stream_receive_window(SERVER_STREAM_WINDOW.into());
+    tc.send_window(SERVER_CONNECTION_WINDOW.into());
+    // Nothing here reads QUIC datagrams; quinn would keep up to 1.25 MB of them.
+    tc.datagram_receive_buffer_size(None);
+}
+
 /// Build a quinn server config that presents `bundle` and speaks h3.
 pub fn server_config(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
-    server_config_tuned(bundle, transport_config()?)
+    let mut tc = transport_config()?;
+    bound_for_server(&mut tc);
+    server_config_tuned(bundle, Arc::new(tc))
 }
 
 /// Like `server_config` but with a caller-supplied transport config (tests).
@@ -133,29 +158,29 @@ const MTUD_UPPER_BOUND: u16 = 1452;
 
 /// Transport config for an obfuscated connection: same keep-alive/idle as the plain path,
 /// but MTU discovery capped `OBF_OVERHEAD` lower so the salt always fits within the path MTU.
-fn obf_transport_config() -> Result<Arc<quinn::TransportConfig>> {
-    let mut tc = quinn::TransportConfig::default();
-    tc.keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)));
-    tc.max_idle_timeout(Some(Duration::from_secs(QUIC_MAX_IDLE_SECS).try_into()?));
+fn obf_transport_config() -> Result<quinn::TransportConfig> {
+    let mut tc = transport_config()?;
     let mut mtud = quinn::MtuDiscoveryConfig::default();
     mtud.upper_bound(MTUD_UPPER_BOUND - OBF_OVERHEAD);
     tc.mtu_discovery_config(Some(mtud));
-    Ok(Arc::new(tc))
+    Ok(tc)
 }
 
 /// Build a quinn client config that trusts exactly `trust` and speaks h3.
 pub fn client_config(trust: &CertBundle) -> Result<quinn::ClientConfig> {
-    client_config_tuned(trust, transport_config()?)
+    client_config_tuned(trust, Arc::new(transport_config()?))
 }
 
 /// Like `client_config` but with the MTU lowered for Salamander obfuscation overhead.
 pub fn client_config_obf(trust: &CertBundle) -> Result<quinn::ClientConfig> {
-    client_config_tuned(trust, obf_transport_config()?)
+    client_config_tuned(trust, Arc::new(obf_transport_config()?))
 }
 
 /// Like `server_config` but with the MTU lowered for Salamander obfuscation overhead.
 pub fn server_config_obf(bundle: &CertBundle) -> Result<quinn::ServerConfig> {
-    server_config_tuned(bundle, obf_transport_config()?)
+    let mut tc = obf_transport_config()?;
+    bound_for_server(&mut tc);
+    server_config_tuned(bundle, Arc::new(tc))
 }
 
 /// Like `client_config` but with a caller-supplied transport config (tests).
@@ -184,6 +209,23 @@ mod tests {
             "construct-transport-test-{}-{name}",
             std::process::id()
         ))
+    }
+
+    /// Both listeners, not only the one production runs today.
+    #[test]
+    fn every_server_config_is_bounded() {
+        let bundle = self_signed(vec!["localhost".into()]).unwrap();
+        for config in [server_config(&bundle), server_config_obf(&bundle)] {
+            let shown = format!("{:?}", config.unwrap().transport);
+            for want in [
+                "receive_window: 1048576",
+                "stream_receive_window: 262144",
+                "send_window: 1048576",
+                "datagram_receive_buffer_size: None",
+            ] {
+                assert!(shown.contains(want), "{want} not in {shown}");
+            }
+        }
     }
 
     #[test]

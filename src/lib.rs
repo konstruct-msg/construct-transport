@@ -13,6 +13,7 @@ pub mod client;
 pub mod echo_server;
 pub mod ffi;
 pub mod grpc;
+pub mod h3_guard;
 pub mod obf_socket;
 pub mod proxy;
 pub mod salamander;
